@@ -1,34 +1,37 @@
 # Hyperliquid Mirror Bot: Testnet to Live Deployment Workflow
 
 ## Overview
-This bot mirrors the perp futures positions of a target trader's wallet on Hyperliquid. Since it tracks another portfolio's live trades rather than a standalone strategy, backtesting is skipped in favor of direct testnet validation.
+This bot mirrors the perp futures positions of a target invoapp portfolio onto Hyperliquid. Signals come from polling the invoapp API (`fetch_open_positions.py`); execution happens on Hyperliquid via the Python SDK. Since it tracks another portfolio's live trades rather than a standalone strategy, backtesting is skipped in favor of direct testnet validation.
 
 ---
 
 ## Phase 1: Environment Setup
 
-- Create a Hyperliquid testnet account
-- Fund the account with testnet USDC via the faucet
-- Generate an API (agent) wallet, kept separate from your main wallet, for programmatic order placement
-- Install `hyperliquid-python-sdk` (or integrate directly with the REST/WebSocket API)
-- Identify the target trader's wallet address; Hyperliquid exposes position and fill data publicly on-chain, no permission required
+- [x] Create a Hyperliquid testnet account
+- [x] Fund the account with testnet USDC via the faucet (https://app.hyperliquid-testnet.xyz/drip; requires a wallet that has been funded on mainnet)
+- [x] Generate API (agent) wallets, kept separate from the main wallet, for programmatic order placement — approved separately per network (testnet and mainnet)
+- [x] Store credentials outside the Drive-synced folder in `C:\Users\ashne\.secrets\invo_mirror_bot.env`: invoapp JWT + portfolio ID, `HL_ACCOUNT_ADDRESS` (main wallet public address), `HL_TESTNET_SECRET_KEY` and `HL_MAINNET_SECRET_KEY` (API wallet private keys)
+- [x] Install `hyperliquid-python-sdk`
+- [x] Identify the signal source: the target invoapp portfolio (`PORTFOLIO_ID`), fetched with `fetch_open_positions.py`
 
 ---
 
 ## Phase 2: Build the Mirror Logic
 
-- Subscribe to the target wallet's activity via WebSocket (`userFills`, `userEvents`) or poll the info endpoint
+- Poll the invoapp API on an interval and diff consecutive position snapshots to detect opens, closes, and size changes
+- Map invoapp tickers to Hyperliquid coin names (e.g. plain `ETH`, `BTC`); skip or alert on assets not listed on Hyperliquid
 - Define the mirroring rule:
   - Fixed ratio of target's position size
   - Fixed dollar allocation per trade
   - Proportional to your account equity vs the target's equity
-- Map target's asset, side, and size to an equivalent order on your account
+- Map target's asset, side, size, and leverage to an equivalent order on your account (convert invoapp USD position size to coin units, rounded to the asset's `szDecimals`)
 - Choose order type: market (speed) vs limit (price control) and set slippage tolerance
 - Handle edge cases:
-  - Partial fills on the target's side
   - Position increases and decreases (scaling in/out)
   - Leverage mismatches between your account and theirs
   - Full position closes
+  - Positions opened before the bot started (decide: mirror existing or only new)
+  - Polling gaps — a position opened and closed between two polls is invisible
 
 ---
 
@@ -77,8 +80,10 @@ This bot mirrors the perp futures positions of a target trader's wallet on Hyper
 
 ## Summary Checklist
 
-- [ ] Testnet account + agent wallet created
-- [ ] Mirror logic built and mapped to target wallet
+- [x] Testnet account + agent wallets created, credentials stored outside synced folder
+- [x] Testnet account funded via faucet
+- [x] SDK installed
+- [ ] Mirror logic built and mapped to target invoapp portfolio
 - [ ] Risk controls implemented (position cap, leverage cap, daily loss limit)
 - [ ] Logging in place for signals and orders
 - [ ] Testnet run completed, failure modes tested
