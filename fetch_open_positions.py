@@ -1,7 +1,10 @@
 import os
 import requests
+from dotenv import load_dotenv
 
 API_URL = "https://api.invoapp.com/v1_0/investments/get_investments"
+# Secrets live outside the Drive-synced project folder so they are never uploaded
+load_dotenv(r"C:\Users\ashne\.secrets\invo_mirror_bot.env")
 
 def parse_open_trades(response):
     if not response.get("success") or response.get("error"):
@@ -45,7 +48,7 @@ def fetch_open_trades(portfolio_id, jwt_token, page=1, size=10):
     return parse_open_trades(resp.json())
 
 if __name__ == "__main__":
-    portfolio_id = "ab15d342-c3c6-4b51-b890-5385eae301ae"
+    portfolio_id = os.environ["PORTFOLIO_ID"]
     jwt_token = os.environ["INVOAPP_JWT"]
     trades = fetch_open_trades(portfolio_id, jwt_token)
     for trade in trades:
