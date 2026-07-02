@@ -1,4 +1,5 @@
 .env
+logs/
 venv/
 venv_wsl/
 __pycache__/

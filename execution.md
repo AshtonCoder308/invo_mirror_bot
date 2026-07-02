@@ -83,9 +83,9 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
 - [x] Testnet account + agent wallets created, credentials stored outside synced folder
 - [x] Testnet account funded via faucet
 - [x] SDK installed
-- [ ] Mirror logic built and mapped to target invoapp portfolio
+- [x] Mirror logic built and mapped to target invoapp portfolio (`mirror_bot.py`; dry-run verified, live testnet validation pending)
 - [ ] Risk controls implemented (position cap, leverage cap, daily loss limit)
-- [ ] Logging in place for signals and orders
+- [x] Logging in place for signals and orders (console + `logs/mirror.log`)
 - [ ] Testnet run completed, failure modes tested
 - [ ] Mainnet dry run at minimum size completed
 - [ ] Alerting and kill switch active
