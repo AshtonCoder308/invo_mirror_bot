@@ -38,6 +38,16 @@ class HLClient:
     def is_listed(self, coin):
         return coin in self.assets
 
+    def open_positions(self):
+        """Coin -> signed size for every position actually open on the account."""
+        state = self.info.user_state(self.address)
+        positions = {}
+        for ap in state["assetPositions"]:
+            szi = float(ap["position"]["szi"])
+            if szi:
+                positions[ap["position"]["coin"]] = szi
+        return positions
+
     def mid(self, coin):
         return float(self.info.all_mids()[coin])
 

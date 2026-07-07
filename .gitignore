@@ -1,5 +1,6 @@
 .env
 logs/
+open_positions.json
 venv/
 venv_wsl/
 __pycache__/
