@@ -30,7 +30,7 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
   - Position increases and decreases (scaling in/out)
   - Leverage mismatches between your account and theirs
   - Full position closes
-  - Positions opened before the bot started (decide: mirror existing or only new)
+  - Positions opened before the bot started (decision: mirror existing positions on first start; tracked state is persisted to `open_positions.json` so restarts resume without re-mirroring)
   - Polling gaps — a position opened and closed between two polls is invisible
 
 ---
