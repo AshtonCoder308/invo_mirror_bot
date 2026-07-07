@@ -83,10 +83,13 @@ def handle_open(client, state, trade):
                 trade.get("price_target"), trade.get("stop_loss"))
             logger.warning("OPEN %s: adopted existing %s position (size %s) instead of opening",
                            tid, coin, szi)
-        elif szi:
-            logger.warning("OPEN %s: exchange holds an opposite-direction %s position "
-                           "(size %s) - not mirrored, resolve manually", tid, coin, szi)
         else:
+            if szi:
+                # Exchange holds the coin in the wrong direction: flip it to
+                # match the portfolio - close everything, then open fresh
+                logger.warning("OPEN %s: closing opposite-direction %s position (size %s) "
+                               "to match portfolio", tid, coin, szi)
+                client.close_position(coin)
             size = client.open_position(coin, entry["is_buy"], config.FIXED_MARGIN_USD, entry["leverage"])
             entry["hl_size"] = size
             entry["mirrored"] = True

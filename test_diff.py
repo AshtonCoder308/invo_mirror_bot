@@ -123,12 +123,14 @@ def test_open_adopts_existing_same_direction_position():
     assert entry["mirrored"] is True and entry["hl_size"] == 0.5
 
 
-def test_open_skips_opposite_direction_position():
-    client = StubClient(positions={"BTC": -0.5})  # short, trade is long
+def test_open_flips_opposite_direction_position():
+    # Exchange holds BTC short but the trade is long: close it all, open fresh
+    client = StubClient(positions={"BTC": -0.5})
     state = {"mirrored": {}}
     handle_open(client, state, trade("1"))
-    assert not client.orders
-    assert state["mirrored"]["1"]["mirrored"] is False
+    assert client.orders == [("close", "BTC", None), ("open", "BTC")]
+    entry = state["mirrored"]["1"]
+    assert entry["mirrored"] is True and entry["hl_size"] == 1.0
 
 
 def test_open_without_collision_mirrors():
