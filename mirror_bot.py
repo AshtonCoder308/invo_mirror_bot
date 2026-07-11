@@ -57,6 +57,23 @@ def diff_snapshots(prev, curr):
     return opens, closes, resizes
 
 
+def allocate_margin(account_value, free_margin, total_notional, leverage):
+    """Risk-checked margin for a new trade, or None when the trade is rejected.
+
+    Each trade gets an equal slice of account value (account_value /
+    MAX_OPEN_TRADES); when free margin can't cover a full slice, whatever is
+    left gets invested instead. The implied notional is then clamped by the
+    per-position cap and the account-wide leverage cap, and the trade is
+    rejected outright if what survives is below the exchange minimum."""
+    margin = min(account_value / config.MAX_OPEN_TRADES, free_margin)
+    notional = min(margin * leverage,
+                   config.MAX_POSITION_NOTIONAL_USD,
+                   account_value * config.MAX_ACCOUNT_LEVERAGE - total_notional)
+    if notional < config.MIN_NOTIONAL_USD:
+        return None
+    return notional / leverage
+
+
 def handle_open(client, state, trade):
     tid = str(trade["id"])
     if tid in state["mirrored"]:
@@ -67,6 +84,10 @@ def handle_open(client, state, trade):
     entry = {"coin": coin, "is_buy": trade["direction"] == "long", "mirrored": False,
              "hl_size": 0, "leverage": trade.get("leverage") or 1, "tpsl_oids": [],
              "target_size": trade["position_size"]}
+    # Track the entry before any order goes out: poll_once persists state even
+    # when a handler raises, so a failure after open_position (e.g. TP/SL
+    # rejected) must not leave an open exchange position untracked
+    state["mirrored"][tid] = entry
     if not client.is_listed(coin):
         logger.warning("skip %s (%s, asset_type=%s): %s not listed on Hyperliquid",
                        tid, trade["ticker"], trade.get("asset_type"), coin)
@@ -83,21 +104,27 @@ def handle_open(client, state, trade):
                 trade.get("price_target"), trade.get("stop_loss"))
             logger.warning("OPEN %s: adopted existing %s position (size %s) instead of opening",
                            tid, coin, szi)
+        elif szi:
+            # Exchange holds the coin in the wrong direction: never trade over
+            # it, just warn and leave it alone (mirrored stays False)
+            logger.warning("OPEN %s: exchange holds %s in the opposite direction (size %s), "
+                           "skipping - resolve manually", tid, coin, szi)
         else:
-            if szi:
-                # Exchange holds the coin in the wrong direction: flip it to
-                # match the portfolio - close everything, then open fresh
-                logger.warning("OPEN %s: closing opposite-direction %s position (size %s) "
-                               "to match portfolio", tid, coin, szi)
-                client.close_position(coin)
-            size = client.open_position(coin, entry["is_buy"], config.FIXED_MARGIN_USD, entry["leverage"])
-            entry["hl_size"] = size
-            entry["mirrored"] = True
-            entry["tpsl_oids"] = client.place_tpsl(
-                coin, entry["is_buy"], size, trade.get("price_target"), trade.get("stop_loss"))
-            logger.info("OPEN mirrored: %s %s (invoapp trade %s)",
-                        coin, "long" if entry["is_buy"] else "short", tid)
-    state["mirrored"][tid] = entry
+            lev = min(entry["leverage"], config.MAX_LEVERAGE)
+            account_value, total_notional, margin_used = client.margin_summary()
+            margin = allocate_margin(account_value, account_value - margin_used, total_notional, lev)
+            if margin is None:
+                logger.warning("OPEN %s: rejected by risk limits - no capital left for %s "
+                               "(account %.2f, free %.2f, open notional %.2f)",
+                               tid, coin, account_value, account_value - margin_used, total_notional)
+            else:
+                size = client.open_position(coin, entry["is_buy"], margin, lev)
+                entry["hl_size"] = size
+                entry["mirrored"] = True
+                entry["tpsl_oids"] = client.place_tpsl(
+                    coin, entry["is_buy"], size, trade.get("price_target"), trade.get("stop_loss"))
+                logger.info("OPEN mirrored: %s %s margin=%.2f (invoapp trade %s)",
+                            coin, "long" if entry["is_buy"] else "short", margin, tid)
 
 
 def handle_close(client, state, trade):
@@ -137,16 +164,58 @@ def handle_resize(client, state, old_trade, new_trade):
         return
     new_size = client.round_size(coin, entry["hl_size"] * ratio)
     delta = new_size - entry["hl_size"]
-    if abs(delta) * client.mid(coin) < config.MIN_NOTIONAL_USD:
+    mid = client.mid(coin)
+    if abs(delta) * mid < config.MIN_NOTIONAL_USD:
         logger.debug("RESIZE %s: delta %s below minimum notional, skipped", coin, delta)
         return
     if delta > 0:
+        # An increase adds exposure, so it obeys the same notional caps as an
+        # open, plus what free margin can actually collateralize at the
+        # position's leverage; clamp rather than skip so the mirror tracks as
+        # closely as allowed
+        account_value, total_notional, margin_used = client.margin_summary()
+        lev = min(entry["leverage"], config.MAX_LEVERAGE)
+        headroom = min(config.MAX_POSITION_NOTIONAL_USD - entry["hl_size"] * mid,
+                       account_value * config.MAX_ACCOUNT_LEVERAGE - total_notional,
+                       (account_value - margin_used) * lev)
+        if delta * mid > headroom:
+            clamped = client.round_size(coin, max(headroom, 0.0) / mid)
+            logger.warning("RESIZE %s: increase clamped by risk caps (%s -> %s)",
+                           coin, delta, clamped)
+            delta = clamped
+            if delta * mid < config.MIN_NOTIONAL_USD:
+                # Nothing sendable survives the caps; still adopt the new
+                # baseline so the same increase isn't retried every poll
+                entry["target_size"] = new_trade["position_size"]
+                return
+            new_size = entry["hl_size"] + delta
         client.increase_position(coin, entry["is_buy"], delta)
     else:
         client.close_position(coin, -delta)
     entry["hl_size"] = new_size
     entry["target_size"] = new_trade["position_size"]
     logger.info("RESIZE mirrored: %s %s -> %s (invoapp trade %s)", coin, entry["hl_size"] - delta, new_size, tid)
+
+
+def check_daily_loss(client, state):
+    """True when equity fell DAILY_LOSS_LIMIT below the UTC day's starting
+    equity - the bot must halt. Anchors a fresh baseline at each UTC day."""
+    equity = client.margin_summary()[0]
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    risk = state.get("risk") or {}
+    if risk.get("day") != today:
+        state["risk"] = {"day": today, "day_start_equity": equity}
+        save_state(state)
+        return False
+    floor = risk["day_start_equity"] * (1 - config.DAILY_LOSS_LIMIT)
+    if equity < floor:
+        msg = (f"daily loss limit hit: equity {equity:.2f} below {floor:.2f} "
+               f"({config.DAILY_LOSS_LIMIT:.0%} under day start {risk['day_start_equity']:.2f}) - "
+               f"bot halted, open positions and TP/SL orders left untouched")
+        logger.error(msg)
+        print(f"\n!!! {msg} !!!")
+        return True
+    return False
 
 
 def reconcile(client, state):
@@ -231,6 +300,10 @@ def main():
 
     while True:
         try:
+            # In dry-run mirrored positions never exist on the exchange, so
+            # equity is unrelated to the bot's activity and the check is noise
+            if not config.DRY_RUN and check_daily_loss(client, state):
+                return
             state = poll_once(client, state, portfolio_id, jwt_token)
         except requests.HTTPError as e:
             if _jwt_expired(e):

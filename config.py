@@ -14,9 +14,14 @@ BASE_URL = constants.TESTNET_API_URL
 POLL_INTERVAL_S = 120
 RETRY_DELAY_S = 10  # quick retry after a transient invoapp error before waiting a full poll
 
-# Placeholder sizing: fixed margin per mirrored trade (notional = margin * leverage).
-# Later: proportional to account equity vs target portfolio equity from invoapp.
-FIXED_MARGIN_USD = 100.0
+# Dynamic sizing: each new trade's margin is an equal slice of total account
+# value (unrealized PnL included), or whatever free margin is left if that's less.
+MAX_OPEN_TRADES = 3
+
+# Risk controls (phase 3). The notional caps apply to opens and to resize increases.
+MAX_POSITION_NOTIONAL_USD = 20_000.0  # hard cap on any single position's notional
+MAX_ACCOUNT_LEVERAGE = 10.0           # cap on total open notional / account value
+DAILY_LOSS_LIMIT = 0.10  # halt the bot when equity falls this far below the UTC day's start
 
 SLIPPAGE = 0.01
 

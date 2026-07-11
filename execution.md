@@ -24,6 +24,7 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
   - Fixed ratio of target's position size
   - Fixed dollar allocation per trade
   - Proportional to your account equity vs the target's equity
+  - (implemented: equal slices of own account value — each trade's margin is account value / `MAX_OPEN_TRADES`, or the remaining free margin if that's less)
 - Map target's asset, side, size, and leverage to an equivalent order on your account (convert invoapp USD position size to coin units, rounded to the asset's `szDecimals`)
 - Choose order type: market (speed) vs limit (price control) and set slippage tolerance
 - Handle edge cases:
@@ -37,11 +38,11 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
 
 ## Phase 3: Risk Controls (build before any live testing)
 
-- Max position size per asset
-- Max total exposure / account-wide leverage cap
-- Daily loss limit that automatically halts the bot
-- Reject trades if mirrored size implies unrealistic leverage for your account balance
-- Full logging of every signal received and every order sent (timestamp, size, price, response)
+- [x] Max position size per asset (`MAX_POSITION_NOTIONAL_USD` caps every open and resize increase)
+- [x] Max total exposure / account-wide leverage cap (total open notional capped at `MAX_ACCOUNT_LEVERAGE` × account value)
+- [x] Daily loss limit that automatically halts the bot (`DAILY_LOSS_LIMIT` vs the UTC day's starting equity, checked every poll; positions are left untouched on halt)
+- [x] Reject trades if mirrored size implies unrealistic leverage for your account balance (per-trade margin = min(account value / `MAX_OPEN_TRADES`, free margin), rejected when the surviving notional is below `MIN_NOTIONAL_USD`)
+- [x] Full logging of every signal received and every order sent (timestamp, size, price, response)
 
 ---
 
@@ -84,7 +85,7 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
 - [x] Testnet account funded via faucet
 - [x] SDK installed
 - [x] Mirror logic built and mapped to target invoapp portfolio (`mirror_bot.py`; dry-run verified, live testnet validation pending)
-- [ ] Risk controls implemented (position cap, leverage cap, daily loss limit)
+- [x] Risk controls implemented (position cap, leverage cap, daily loss limit)
 - [x] Logging in place for signals and orders (console + `logs/mirror.log`)
 - [ ] Testnet run completed, failure modes tested
 - [ ] Mainnet dry run at minimum size completed

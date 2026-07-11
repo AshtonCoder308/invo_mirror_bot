@@ -48,6 +48,13 @@ class HLClient:
                 positions[ap["position"]["coin"]] = szi
         return positions
 
+    def margin_summary(self):
+        """(account_value, total_notional, margin_used) across the whole account.
+        account_value marks positions to market, so it includes unrealized PnL;
+        free (uninvested) margin is account_value - margin_used."""
+        ms = self.info.user_state(self.address)["marginSummary"]
+        return float(ms["accountValue"]), float(ms["totalNtlPos"]), float(ms["totalMarginUsed"])
+
     def mid(self, coin):
         return float(self.info.all_mids()[coin])
 
