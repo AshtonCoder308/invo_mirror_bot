@@ -5,9 +5,9 @@ import tempfile
 
 import config
 from hl_client import OrderError
-from mirror_bot import (allocate_margin, check_daily_loss, check_pending_entries,
-                        diff_snapshots, handle_close, handle_fill, handle_open,
-                        load_state, normalize_ticker, save_state)
+from mirror_bot import (allocate_margin, check_pending_entries, diff_snapshots,
+                        handle_close, handle_fill, handle_open, load_state,
+                        normalize_ticker, retry_unmirrored, save_state)
 
 
 def trade(tid, size=100.0, direction="long", entry_price=100.0):
@@ -38,6 +38,13 @@ class StubClient:
 
     def round_size(self, coin, sz):
         return round(sz, 4)
+
+    def mid(self, coin):
+        return 100.0
+
+    def open_position(self, coin, is_buy, margin_usd, leverage):
+        self.orders.append(("open", coin))
+        return 1.0
 
     def place_entry_trigger(self, coin, is_buy, size, trigger_px, leverage):
         self.orders.append(("entry_trigger", coin, size, trigger_px))
@@ -180,6 +187,43 @@ def test_open_short_places_trigger_above_entry():
     # fp noise (100 * 1.005 != 100.5 exactly); the real client rounds the price
     assert kind == "entry_trigger" and abs(trigger_px - 100.5) < 1e-9
     assert state["mirrored"]["1"]["is_buy"] is False
+
+
+def test_open_long_at_market_when_price_already_beyond_trigger():
+    # Target long from 110, stub mid is 100: price is already below the 109.45
+    # trigger, which the exchange would reject as triggering immediately -
+    # take the better entry at market and place TP/SL right away
+    client = StubClient()
+    state = {"mirrored": {}}
+    handle_open(client, state, trade("1", entry_price=110.0))
+    assert client.orders == [("open", "BTC"), ("tpsl", "BTC", 1.0)]
+    entry = state["mirrored"]["1"]
+    assert entry["mirrored"] is True and entry["hl_size"] == 1.0
+    assert entry["entry_oid"] is None
+
+
+def test_open_short_at_market_when_price_already_beyond_trigger():
+    # Target short from 90, stub mid is 100: already above the 90.45 trigger
+    client = StubClient()
+    state = {"mirrored": {}}
+    handle_open(client, state, trade("1", direction="short", entry_price=90.0))
+    assert client.orders == [("open", "BTC"), ("tpsl", "BTC", 1.0)]
+    assert state["mirrored"]["1"]["mirrored"] is True
+
+
+def test_retry_unmirrored_drops_stuck_entries_at_startup():
+    with tmp_state_file():
+        stuck = {"coin": "ETH", "is_buy": False, "mirrored": False, "hl_size": 0,
+                 "leverage": 25, "tpsl_oids": [], "entry_oid": None,
+                 "tp_px": None, "sl_px": None}
+        state = {"snapshot": {"1": trade("1"), "2": trade("2"), "3": trade("3")},
+                 "mirrored": {"1": stuck, "2": mirrored_entry(), "3": pending_entry(oid=7)}}
+        retry_unmirrored(state)
+        # Stuck entry replays as an open on the first poll; the mirrored
+        # position and the resting trigger are untouched
+        assert "1" not in state["mirrored"] and "1" not in state["snapshot"]
+        assert "2" in state["mirrored"] and "2" in state["snapshot"]
+        assert "3" in state["mirrored"] and "3" in state["snapshot"]
 
 
 def test_open_rejected_by_risk_limits_not_retried():
@@ -359,21 +403,6 @@ def test_allocate_margin_caps_account_leverage():
         assert allocate_margin(3000.0, 3000.0, 6000.0, 1) is None
     finally:
         config.MAX_ACCOUNT_LEVERAGE = orig
-
-
-def test_daily_loss_limit():
-    with tmp_state_file():
-        state = {"snapshot": {}, "mirrored": {}}
-        client = StubClient(account=(1000.0, 0.0, 0.0))
-        # First check of the day anchors the starting equity
-        assert check_daily_loss(client, state) is False
-        assert state["risk"]["day_start_equity"] == 1000.0
-        # Drawdown within the limit: keep running
-        client.account = (1000.0 * (1 - config.DAILY_LOSS_LIMIT) + 1, 0.0, 0.0)
-        assert check_daily_loss(client, state) is False
-        # Drawdown past the limit: halt
-        client.account = (1000.0 * (1 - config.DAILY_LOSS_LIMIT) - 1, 0.0, 0.0)
-        assert check_daily_loss(client, state) is True
 
 
 def test_normalize_ticker():

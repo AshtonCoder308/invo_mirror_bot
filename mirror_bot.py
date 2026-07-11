@@ -106,17 +106,33 @@ def handle_open(client, state, trade):
                        "(account %.2f, free %.2f, open notional %.2f)",
                        tid, coin, account_value, account_value - margin_used, total_notional)
         return
-    # Rest a trigger ENTRY_IMPROVEMENT beyond the target's entry, in our favor
-    # (long: below, short: above). mirrored stays False until it fills - TP/SL
-    # are reduce-only and need a position to exist first
+    # Enter at ENTRY_IMPROVEMENT beyond the target's entry, in our favor
+    # (long: below, short: above)
     improve = 1 - config.ENTRY_IMPROVEMENT if entry["is_buy"] else 1 + config.ENTRY_IMPROVEMENT
     trigger_px = trade["entry_price"] * improve
+    mid = client.mid(coin)
+    already_better = mid <= trigger_px if entry["is_buy"] else mid >= trigger_px
+    side = "long" if entry["is_buy"] else "short"
+    if already_better:
+        # Price is already past the trigger - the exchange would reject the
+        # trigger order as "would trigger immediately". Take the even better
+        # entry at market and guard it right away
+        size = client.open_position(coin, entry["is_buy"], margin, lev)
+        entry["hl_size"] = size
+        entry["mirrored"] = True
+        entry["tpsl_oids"] = client.place_tpsl(coin, entry["is_buy"], size,
+                                               entry["tp_px"], entry["sl_px"])
+        logger.info("OPEN mirrored at market: %s %s size=%s (price %s already beyond "
+                    "trigger %s) (invoapp trade %s)", coin, side, size, mid, trigger_px, tid)
+        return
+    # Rest the trigger; mirrored stays False until it fills - TP/SL are
+    # reduce-only and need a position to exist first
     size = client.round_size(coin, margin * lev / trigger_px)
     if size <= 0:
         raise OrderError(f"{coin}: size rounds to 0")
     entry["entry_oid"] = client.place_entry_trigger(coin, entry["is_buy"], size, trigger_px, lev)
     logger.info("OPEN trigger placed: %s %s size=%s trigger=%s (invoapp trade %s)",
-                coin, "long" if entry["is_buy"] else "short", size, trigger_px, tid)
+                coin, side, size, trigger_px, tid)
 
 
 def handle_close(client, state, trade):
@@ -225,25 +241,19 @@ def handle_fill(client, state, fill):
         save_state(state)
 
 
-def check_daily_loss(client, state):
-    """True when equity fell DAILY_LOSS_LIMIT below the UTC day's starting
-    equity - the bot must halt. Anchors a fresh baseline at each UTC day."""
-    equity = client.margin_summary()[0]
-    today = time.strftime("%Y-%m-%d", time.gmtime())
-    risk = state.get("risk") or {}
-    if risk.get("day") != today:
-        state["risk"] = {"day": today, "day_start_equity": equity}
+def retry_unmirrored(state):
+    """Drop unmirrored entries with no resting trigger (risk-rejected, skipped,
+    vanished orders) from state at startup: the first poll then replays them
+    through handle_open, which re-applies every guard under fresh conditions.
+    Entries with a resting trigger or an open position are left alone."""
+    retry = [tid for tid, e in state["mirrored"].items()
+             if not e["mirrored"] and e.get("entry_oid") is None]
+    for tid in retry:
+        del state["mirrored"][tid]
+        state["snapshot"].pop(tid, None)
+    if retry:
         save_state(state)
-        return False
-    floor = risk["day_start_equity"] * (1 - config.DAILY_LOSS_LIMIT)
-    if equity < floor:
-        msg = (f"daily loss limit hit: equity {equity:.2f} below {floor:.2f} "
-               f"({config.DAILY_LOSS_LIMIT:.0%} under day start {risk['day_start_equity']:.2f}) - "
-               f"bot halted, open positions and TP/SL orders left untouched")
-        logger.error(msg)
-        print(f"\n!!! {msg} !!!")
-        return True
-    return False
+        logger.info("startup: retrying %d previously unmirrored trades on first poll", len(retry))
 
 
 def reconcile(client, state):
@@ -324,6 +334,7 @@ def main():
     else:
         logger.info("loaded state from %s: %d tracked positions",
                     config.OPEN_POSITIONS_PATH, len(state["mirrored"]))
+        retry_unmirrored(state)
     if not config.DRY_RUN:
         # Dry-run never places orders, so tracked state and the exchange are
         # unrelated and comparing them would only produce false warnings
@@ -331,10 +342,6 @@ def main():
 
     while True:
         try:
-            # In dry-run mirrored positions never exist on the exchange, so
-            # equity is unrelated to the bot's activity and the check is noise
-            if not config.DRY_RUN and check_daily_loss(client, state):
-                return
             state = poll_once(client, state, portfolio_id, jwt_token)
         except requests.HTTPError as e:
             if _jwt_expired(e):

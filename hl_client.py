@@ -71,10 +71,16 @@ class HLClient:
 
     def margin_summary(self):
         """(account_value, total_notional, margin_used) across the whole account.
-        account_value marks positions to market, so it includes unrealized PnL;
-        free (uninvested) margin is account_value - margin_used."""
+        account_value marks positions to market (unrealized PnL included) and
+        adds the spot USDC balance, which a unified account uses as perp
+        collateral even though the perp clearinghouse reports it as 0; free
+        (uninvested) margin is account_value - margin_used."""
         ms = self.info.user_state(self.address)["marginSummary"]
-        return float(ms["accountValue"]), float(ms["totalNtlPos"]), float(ms["totalMarginUsed"])
+        spot_usdc = sum(float(b["total"])
+                        for b in self.info.spot_user_state(self.address)["balances"]
+                        if b["coin"] == "USDC")
+        return (float(ms["accountValue"]) + spot_usdc,
+                float(ms["totalNtlPos"]), float(ms["totalMarginUsed"]))
 
     def mid(self, coin):
         return float(self.info.all_mids()[coin])
