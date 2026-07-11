@@ -25,10 +25,15 @@ DAILY_LOSS_LIMIT = 0.10  # halt the bot when equity falls this far below the UTC
 
 SLIPPAGE = 0.01
 
-# invoapp's positionSize is mark-to-market, so it drifts with price every poll.
-# Only mirror a resize when it moved this far (relative) from the size we last
-# scaled to; smaller changes are treated as price noise.
-RESIZE_THRESHOLD = 0.05
+# Hyperliquid coin names (e.g. "BTC") never mirrored even when the target
+# trades them; the trade is tracked as mirrored=False so it isn't retried.
+IGNORED_COINS = set()
+
+# Entries rest as trigger-market orders placed this far beyond the target's
+# entry price, in our favor (long: 0.5% below, short: 0.5% above). If the
+# price never reaches the trigger, the trade is never entered.
+ENTRY_IMPROVEMENT = 0.005
+
 MAX_LEVERAGE = 10          # cap regardless of the target's leverage
 MIN_NOTIONAL_USD = 10.0    # Hyperliquid minimum order size
 

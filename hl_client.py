@@ -26,17 +26,38 @@ def _check(result):
 
 
 class HLClient:
-    def __init__(self):
+    def __init__(self, on_fill=None):
         # PUBLIC_KEY = main wallet address; TESTNET_PRIVATE_KEY = API/agent wallet key
         self.address = os.environ["PUBLIC_KEY"]
         wallet = eth_account.Account.from_key(os.environ["TESTNET_PRIVATE_KEY"])
-        self.info = Info(config.BASE_URL, skip_ws=True)
+        # The websocket is only needed to push fills to on_fill; without a
+        # callback, skip it entirely
+        self.info = Info(config.BASE_URL, skip_ws=on_fill is None)
         self.exchange = Exchange(wallet, config.BASE_URL, account_address=self.address)
         self.assets = {a["name"]: a for a in self.info.meta()["universe"]}
+        if on_fill is not None:
+            self._subscribe_fills(on_fill)
         logger.info("connected to %s as %s (%d assets)", config.BASE_URL, self.address, len(self.assets))
+
+    def _subscribe_fills(self, on_fill):
+        def handler(msg):
+            data = msg.get("data") or {}
+            if data.get("isSnapshot"):
+                # Historical fills replayed on (re)connect, not new activity
+                return
+            for fill in data.get("fills", []):
+                # Runs on the websocket thread: on_fill must only enqueue,
+                # never touch client or bot state
+                on_fill(fill)
+
+        self.info.subscribe({"type": "userFills", "user": self.address}, handler)
 
     def is_listed(self, coin):
         return coin in self.assets
+
+    def open_orders(self):
+        """Oids of every order currently resting on the account."""
+        return {o["oid"] for o in self.info.open_orders(self.address)}
 
     def open_positions(self):
         """Coin -> signed size for every position actually open on the account."""
@@ -101,6 +122,30 @@ class HLClient:
             return
         logger.info("close %s size=%s -> %s", coin, size or "all", result)
         _check(result)
+
+    def place_entry_trigger(self, coin, is_buy, size, trigger_px, leverage):
+        """Resting trigger order that market-opens when price reaches trigger_px.
+        tpsl='tp' triggers on a fall for buys and a rise for sells, which is the
+        better-price direction for an entry. Returns the resting oid."""
+        leverage = min(leverage or 1, config.MAX_LEVERAGE, self.assets[coin]["maxLeverage"])
+        trigger_px = self.round_price(coin, trigger_px)
+        # Market execution on trigger is still slippage-capped by the limit px
+        limit_px = self.round_price(
+            coin, trigger_px * (1 + config.SLIPPAGE if is_buy else 1 - config.SLIPPAGE))
+        side = "long" if is_buy else "short"
+        if config.DRY_RUN:
+            logger.info("DRY RUN: entry trigger %s %s size=%s at %s lev=%sx",
+                        side, coin, size, trigger_px, leverage)
+            return -1
+        self.exchange.update_leverage(leverage, coin)
+        order_type = {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "tp"}}
+        result = self.exchange.order(coin, is_buy, size, limit_px, order_type, reduce_only=False)
+        logger.info("entry trigger %s %s size=%s at %s lev=%sx -> %s",
+                    side, coin, size, trigger_px, leverage, result)
+        for status in _check(result):
+            if "resting" in status:
+                return status["resting"]["oid"]
+        raise OrderError(f"entry trigger for {coin} did not rest: {result}")
 
     def place_tpsl(self, coin, position_is_buy, size, tp_px=None, sl_px=None):
         """Reduce-only trigger orders guarding an open position. Returns resting oids."""
