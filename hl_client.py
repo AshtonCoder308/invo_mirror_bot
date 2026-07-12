@@ -17,11 +17,11 @@ class OrderError(Exception):
 def _check(result):
     """Raise on failure; an 'ok' response can still carry per-order errors."""
     if result.get("status") != "ok":
-        raise OrderError(f"request failed: {result}")
+        raise OrderError(f"Request failed {result}")
     statuses = result["response"]["data"]["statuses"]
     for status in statuses:
         if "error" in status:
-            raise OrderError(f"order rejected: {status['error']}")
+            raise OrderError(f"Order rejected {status['error']}")
     return statuses
 
 
@@ -37,7 +37,7 @@ class HLClient:
         self.assets = {a["name"]: a for a in self.info.meta()["universe"]}
         if on_fill is not None:
             self._subscribe_fills(on_fill)
-        logger.info("connected to %s as %s (%d assets)", config.BASE_URL, self.address, len(self.assets))
+        logger.info(f"Connected to {config.BASE_URL}")
 
     def _subscribe_fills(self, on_fill):
         def handler(msg):
@@ -69,18 +69,30 @@ class HLClient:
                 positions[ap["position"]["coin"]] = szi
         return positions
 
+    def position_breakdown(self):
+        """Coin -> margin used, notional and unrealized PnL for every open
+        position; lets the bot strip foreign positions out of its capital."""
+        state = self.info.user_state(self.address)
+        breakdown = {}
+        for ap in state["assetPositions"]:
+            pos = ap["position"]
+            if float(pos["szi"]):
+                breakdown[pos["coin"]] = {"margin": float(pos["marginUsed"]),
+                                          "notional": float(pos["positionValue"]),
+                                          "upnl": float(pos["unrealizedPnl"])}
+        return breakdown
+
     def margin_summary(self):
-        """(account_value, total_notional, margin_used) across the whole account.
-        account_value marks positions to market (unrealized PnL included) and
-        adds the spot USDC balance, which a unified account uses as perp
-        collateral even though the perp clearinghouse reports it as 0; free
-        (uninvested) margin is account_value - margin_used."""
+        """(available, total_notional, margin_used). available is the unified
+        account's spendable USDC - the spot balance's total minus hold, which
+        is exactly the UI's "Available balance": the exchange already deducts
+        everything committed to positions (isolated buckets, cross usage,
+        resting-order holds) via the hold field."""
         ms = self.info.user_state(self.address)["marginSummary"]
-        spot_usdc = sum(float(b["total"])
+        available = sum(float(b["total"]) - float(b["hold"])
                         for b in self.info.spot_user_state(self.address)["balances"]
                         if b["coin"] == "USDC")
-        return (float(ms["accountValue"]) + spot_usdc,
-                float(ms["totalNtlPos"]), float(ms["totalMarginUsed"]))
+        return (available, float(ms["totalNtlPos"]), float(ms["totalMarginUsed"]))
 
     def mid(self, coin):
         return float(self.info.all_mids()[coin])
@@ -98,36 +110,41 @@ class HLClient:
         leverage = min(leverage or 1, config.MAX_LEVERAGE, self.assets[coin]["maxLeverage"])
         size = self.round_size(coin, margin_usd * leverage / self.mid(coin))
         if size <= 0:
-            raise OrderError(f"{coin}: size rounds to 0")
+            raise OrderError(f"{coin} size rounds to 0")
         side = "long" if is_buy else "short"
         if config.DRY_RUN:
-            logger.info("DRY RUN: open %s %s size=%s lev=%sx", side, coin, size, leverage)
+            logger.info(f"DRY RUN Open {coin} {side} size={size} lev={leverage}x")
             return size
-        self.exchange.update_leverage(leverage, coin)
+        # is_cross=False: bot positions run on isolated margin so each trade's
+        # risk is contained to its own bucket and never the shared balance
+        self.exchange.update_leverage(leverage, coin, is_cross=False)
         result = self.exchange.market_open(coin, is_buy, size, None, config.SLIPPAGE)
-        logger.info("open %s %s size=%s lev=%sx -> %s", side, coin, size, leverage, result)
+        logger.debug(f"Open {coin} response {result}")
         _check(result)
+        logger.info(f"Open {coin} {side} size={size} lev={leverage}x")
         return size
 
     def increase_position(self, coin, is_buy, size):
         if config.DRY_RUN:
-            logger.info("DRY RUN: increase %s by %s", coin, size)
+            logger.info(f"DRY RUN Increase {coin} size={size}")
             return
         result = self.exchange.market_open(coin, is_buy, size, None, config.SLIPPAGE)
-        logger.info("increase %s by %s -> %s", coin, size, result)
+        logger.debug(f"Increase {coin} response {result}")
         _check(result)
+        logger.info(f"Increase {coin} size={size}")
 
     def close_position(self, coin, size=None):
         """Market-close `size` of the coin's position (all of it when size is None)."""
         if config.DRY_RUN:
-            logger.info("DRY RUN: close %s size=%s", coin, size or "all")
+            logger.info(f"DRY RUN Close {coin} size={size or 'all'}")
             return
         result = self.exchange.market_close(coin, size, None, config.SLIPPAGE)
         if result is None:  # SDK returns None when there is no position to close
-            logger.warning("close %s: no position on exchange", coin)
+            logger.warning(f"Close {coin} no position on exchange")
             return
-        logger.info("close %s size=%s -> %s", coin, size or "all", result)
+        logger.debug(f"Close {coin} response {result}")
         _check(result)
+        logger.info(f"Close {coin} size={size or 'all'}")
 
     def place_entry_trigger(self, coin, is_buy, size, trigger_px, leverage):
         """Resting trigger order that market-opens when price reaches trigger_px.
@@ -140,18 +157,21 @@ class HLClient:
             coin, trigger_px * (1 + config.SLIPPAGE if is_buy else 1 - config.SLIPPAGE))
         side = "long" if is_buy else "short"
         if config.DRY_RUN:
-            logger.info("DRY RUN: entry trigger %s %s size=%s at %s lev=%sx",
-                        side, coin, size, trigger_px, leverage)
+            logger.info(f"DRY RUN Entry trigger {coin} {side} size={size} "
+                        f"trigger={trigger_px} lev={leverage}x")
             return -1
-        self.exchange.update_leverage(leverage, coin)
+        # is_cross=False: bot positions run on isolated margin so each trade's
+        # risk is contained to its own bucket and never the shared balance
+        self.exchange.update_leverage(leverage, coin, is_cross=False)
         order_type = {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "tp"}}
         result = self.exchange.order(coin, is_buy, size, limit_px, order_type, reduce_only=False)
-        logger.info("entry trigger %s %s size=%s at %s lev=%sx -> %s",
-                    side, coin, size, trigger_px, leverage, result)
+        logger.debug(f"Entry trigger {coin} response {result}")
         for status in _check(result):
             if "resting" in status:
+                logger.info(f"Entry trigger {coin} {side} size={size} "
+                            f"trigger={trigger_px} lev={leverage}x")
                 return status["resting"]["oid"]
-        raise OrderError(f"entry trigger for {coin} did not rest: {result}")
+        raise OrderError(f"Entry trigger {coin} did not rest {result}")
 
     def place_tpsl(self, coin, position_is_buy, size, tp_px=None, sl_px=None):
         """Reduce-only trigger orders guarding an open position. Returns resting oids."""
@@ -162,21 +182,22 @@ class HLClient:
             px = self.round_price(coin, float(px))
             order_type = {"trigger": {"triggerPx": px, "isMarket": True, "tpsl": kind}}
             if config.DRY_RUN:
-                logger.info("DRY RUN: %s trigger for %s at %s", kind, coin, px)
+                logger.info(f"DRY RUN {kind.upper()} trigger {coin} px={px}")
                 continue
             result = self.exchange.order(coin, not position_is_buy, size, px, order_type, reduce_only=True)
-            logger.info("%s trigger for %s at %s -> %s", kind, coin, px, result)
+            logger.debug(f"{kind.upper()} trigger {coin} response {result}")
             for status in _check(result):
                 if "resting" in status:
+                    logger.info(f"{kind.upper()} trigger {coin} px={px}")
                     oids.append(status["resting"]["oid"])
         return oids
 
     def cancel_orders(self, coin, oids):
         for oid in oids:
             if config.DRY_RUN:
-                logger.info("DRY RUN: cancel %s oid=%s", coin, oid)
+                logger.info(f"DRY RUN Cancel {coin} oid={oid}")
                 continue
             result = self.exchange.cancel(coin, oid)
             # A trigger may have already fired; log instead of raising
             if result.get("status") != "ok":
-                logger.warning("cancel %s oid=%s failed: %s", coin, oid, result)
+                logger.warning(f"Cancel {coin} oid={oid} failed {result}")

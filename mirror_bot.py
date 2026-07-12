@@ -45,8 +45,7 @@ def save_state(state):
 
 def diff_snapshots(prev, curr):
     """Compare trade-id-keyed snapshots. Returns (opens, closes). Target
-    resizes are deliberately not mirrored: once opened, our position only
-    changes via a full close."""
+    resizes are deliberately not mirrored"""
     opens = [t for tid, t in curr.items() if tid not in prev]
     closes = [t for tid, t in prev.items() if tid not in curr]
     return opens, closes
@@ -57,9 +56,7 @@ def allocate_margin(account_value, free_margin, total_notional, leverage):
 
     Each trade gets an equal slice of account value (account_value /
     MAX_OPEN_TRADES); when free margin can't cover a full slice, whatever is
-    left gets invested instead. The implied notional is then clamped by the
-    per-position cap and the account-wide leverage cap, and the trade is
-    rejected outright if what survives is below the exchange minimum."""
+    left gets invested instead"""
     margin = min(account_value / config.MAX_OPEN_TRADES, free_margin)
     notional = min(margin * leverage,
                    config.MAX_POSITION_NOTIONAL_USD,
@@ -69,13 +66,29 @@ def allocate_margin(account_value, free_margin, total_notional, leverage):
     return notional / leverage
 
 
+def adjust_for_foreign(available, total_notional, breakdown, foreign_coins):
+    """(bot_capital, free_margin, bot_notional) for sizing. The exchange's
+    available balance already excludes everything held by positions - foreign
+    and ours - via the spot hold, so foreign trades cost the bot nothing extra;
+    the bot's own positions' margin is added back so the per-trade slice
+    (capital / MAX_OPEN_TRADES) stays a share of all bot money, not just what's
+    left. Foreign notional is stripped so it doesn't eat the leverage cap."""
+    bot_margin = sum(b["margin"] for c, b in breakdown.items() if c not in foreign_coins)
+    f_notional = sum(breakdown[c]["notional"] for c in foreign_coins)
+    return available + bot_margin, available, total_notional - f_notional
+
+
+def tracked_coins(state):
+    return {e["coin"] for e in state["mirrored"].values() if e["mirrored"]}
+
+
 def handle_open(client, state, trade):
     tid = str(trade["id"])
+    coin = normalize_ticker(trade["ticker"])
     if tid in state["mirrored"]:
         # Already mirrored in a previous run whose snapshot wasn't saved yet
-        logger.debug("OPEN %s: already tracked, skipping", tid)
+        logger.debug(f"OPEN {coin} already tracked, skipping")
         return
-    coin = normalize_ticker(trade["ticker"])
     entry = {"coin": coin, "is_buy": trade["direction"] == "long", "mirrored": False,
              "hl_size": 0, "leverage": trade.get("leverage") or 1, "tpsl_oids": [],
              "entry_oid": None, "tp_px": trade.get("price_target"),
@@ -85,26 +98,29 @@ def handle_open(client, state, trade):
     # position on the exchange untracked
     state["mirrored"][tid] = entry
     if coin in config.IGNORED_COINS:
-        logger.info("OPEN %s: %s is in IGNORED_COINS, skipping", tid, coin)
+        logger.info(f"OPEN {coin} in IGNORED_COINS, skipped")
         return
     if not client.is_listed(coin):
-        logger.warning("skip %s (%s, asset_type=%s): %s not listed on Hyperliquid",
-                       tid, trade["ticker"], trade.get("asset_type"), coin)
+        logger.warning(f"OPEN {coin} not listed on Hyperliquid, skipped")
         return
     szi = client.open_positions().get(coin)
     if szi:
         # Never touch a position the bot didn't open, in either direction:
         # warn and leave it alone (mirrored stays False)
-        logger.warning("OPEN %s: exchange already holds %s (size %s) not opened by "
-                       "the bot, skipping - resolve manually", tid, coin, szi)
+        logger.warning(f"OPEN {coin} existing position size={szi} not opened "
+                       "by bot, resolve manually")
         return
     lev = min(entry["leverage"], config.MAX_LEVERAGE)
-    account_value, total_notional, margin_used = client.margin_summary()
-    margin = allocate_margin(account_value, account_value - margin_used, total_notional, lev)
+    available, total_notional, _ = client.margin_summary()
+    breakdown = client.position_breakdown()
+    foreign = set(breakdown) - tracked_coins(state)
+    bot_av, bot_free, bot_notional = adjust_for_foreign(
+        available, total_notional, breakdown, foreign)
+    margin = allocate_margin(bot_av, bot_free, bot_notional, lev)
     if margin is None:
-        logger.warning("OPEN %s: rejected by risk limits - no capital left for %s "
-                       "(account %.2f, free %.2f, open notional %.2f)",
-                       tid, coin, account_value, account_value - margin_used, total_notional)
+        logger.warning(f"OPEN {coin} rejected by risk limits "
+                       f"(capital={bot_av:.2f} free={bot_free:.2f} "
+                       f"notional={bot_notional:.2f})")
         return
     # Enter at ENTRY_IMPROVEMENT beyond the target's entry, in our favor
     # (long: below, short: above)
@@ -122,24 +138,23 @@ def handle_open(client, state, trade):
         entry["mirrored"] = True
         entry["tpsl_oids"] = client.place_tpsl(coin, entry["is_buy"], size,
                                                entry["tp_px"], entry["sl_px"])
-        logger.info("OPEN mirrored at market: %s %s size=%s (price %s already beyond "
-                    "trigger %s) (invoapp trade %s)", coin, side, size, mid, trigger_px, tid)
+        logger.info(f"OPEN {coin} {side} at market size={size} "
+                    f"(mid {mid} past trigger {trigger_px})")
         return
     # Rest the trigger; mirrored stays False until it fills - TP/SL are
     # reduce-only and need a position to exist first
     size = client.round_size(coin, margin * lev / trigger_px)
     if size <= 0:
-        raise OrderError(f"{coin}: size rounds to 0")
+        raise OrderError(f"{coin} size rounds to 0")
     entry["entry_oid"] = client.place_entry_trigger(coin, entry["is_buy"], size, trigger_px, lev)
-    logger.info("OPEN trigger placed: %s %s size=%s trigger=%s (invoapp trade %s)",
-                coin, side, size, trigger_px, tid)
+    logger.info(f"OPEN {coin} {side} trigger placed size={size} trigger={trigger_px}")
 
 
 def handle_close(client, state, trade):
     tid = str(trade["id"])
     entry = state["mirrored"].pop(tid, None)
     if not entry:
-        logger.debug("CLOSE %s: was not tracked, nothing to do", tid)
+        logger.debug(f"CLOSE {normalize_ticker(trade['ticker'])} not tracked, nothing to do")
         return
     if entry.get("entry_oid") is not None:
         # Entry trigger never promoted: cancel it (the trade was never
@@ -152,14 +167,13 @@ def handle_close(client, state, trade):
             if szi and (szi > 0) == entry["is_buy"]:
                 client.cancel_orders(entry["coin"], entry["tpsl_oids"])
                 client.close_position(entry["coin"], abs(szi))
-                logger.warning("CLOSE %s: entry trigger for %s had fired between polls, "
-                               "closed the position", tid, entry["coin"])
+                logger.warning(f"CLOSE {entry['coin']} entry trigger fired "
+                               "between polls, position closed")
                 return
-        logger.info("CLOSE %s: cancelled resting entry trigger for %s (never filled)",
-                    tid, entry["coin"])
+        logger.info(f"CLOSE {entry['coin']} entry trigger cancelled (never filled)")
         return
     if not entry["mirrored"]:
-        logger.debug("CLOSE %s: was not mirrored, nothing to do", tid)
+        logger.debug(f"CLOSE {entry['coin']} was not mirrored, nothing to do")
         return
     # In dry-run mirrored positions never exist on the exchange, so the check
     # would always trip
@@ -167,12 +181,12 @@ def handle_close(client, state, trade):
         # Already closed on the exchange (TP/SL fired, manual close): the
         # account already matches the target - just clean up leftover triggers
         client.cancel_orders(entry["coin"], entry["tpsl_oids"])
-        logger.warning("CLOSE %s: %s already closed on exchange, cleaned up state",
-                       tid, entry["coin"])
+        logger.warning(f"CLOSE {entry['coin']} already closed on exchange, "
+                       "state cleaned up")
         return
     client.cancel_orders(entry["coin"], entry["tpsl_oids"])
     client.close_position(entry["coin"], entry["hl_size"])
-    logger.info("CLOSE mirrored: %s (invoapp trade %s)", entry["coin"], tid)
+    logger.info(f"CLOSE {entry['coin']} size={entry['hl_size']}")
 
 
 def promote_entry(client, entry, size):
@@ -190,29 +204,27 @@ def check_pending_entries(client, state):
     """Poll-time backstop for the websocket: promote entries whose resting
     entry trigger has filled; an oid that vanished without producing a
     position was cancelled externally and stays unmirrored (never retried)."""
-    pending = {tid: e for tid, e in state["mirrored"].items()
-               if not e["mirrored"] and e.get("entry_oid") is not None}
+    pending = [e for e in state["mirrored"].values()
+               if not e["mirrored"] and e.get("entry_oid") is not None]
     if not pending:
         return
     resting = client.open_orders()
     positions = client.open_positions()
-    for tid, entry in pending.items():
+    for entry in pending:
         if entry["entry_oid"] in resting:
             continue  # price hasn't reached the trigger yet
         try:
             szi = positions.get(entry["coin"])
             if szi and (szi > 0) == entry["is_buy"]:
                 promote_entry(client, entry, abs(szi))
-                logger.info("ENTRY filled: %s %s size=%s (invoapp trade %s)",
-                            entry["coin"], "long" if entry["is_buy"] else "short",
-                            entry["hl_size"], tid)
+                side = "long" if entry["is_buy"] else "short"
+                logger.info(f"ENTRY {entry['coin']} {side} filled size={entry['hl_size']}")
             else:
                 entry["entry_oid"] = None
-                logger.warning("ENTRY %s: trigger for %s gone without a fill "
-                               "(cancelled externally?) - trade stays unmirrored",
-                               tid, entry["coin"])
-        except OrderError:
-            logger.exception("failed to promote filled entry of trade %s", tid)
+                logger.warning(f"ENTRY {entry['coin']} trigger gone without a fill "
+                               "(cancelled externally?), stays unmirrored")
+        except OrderError as e:
+            logger.error(f"ENTRY {entry['coin']} promote failed: {e}")
         save_state(state)
 
 
@@ -220,23 +232,20 @@ def handle_fill(client, state, fill):
     """Websocket fill dequeued on the main thread: promote the matching entry
     within ~1s instead of waiting for the next poll's backstop sweep."""
     oid = fill.get("oid")
-    match = next(((tid, e) for tid, e in state["mirrored"].items()
+    entry = next((e for e in state["mirrored"].values()
                   if not e["mirrored"] and e.get("entry_oid") == oid), None)
-    if match is None:
+    if entry is None:
         # TP/SL executions and manual trades land here; the poll-time
         # close/reconcile logic picks those up
-        logger.debug("fill oid %s (%s) matches no pending entry, ignoring",
-                     oid, fill.get("coin"))
+        logger.debug(f"Fill {fill.get('coin')} oid={oid} matches no pending entry, ignored")
         return
-    tid, entry = match
     try:
         # The actual position beats the fill's sz (a merged or partial fill
         # would make them differ)
         szi = client.open_positions().get(entry["coin"])
         promote_entry(client, entry, abs(szi) if szi else float(fill["sz"]))
-        logger.info("ENTRY filled (ws): %s %s size=%s (invoapp trade %s)",
-                    entry["coin"], "long" if entry["is_buy"] else "short",
-                    entry["hl_size"], tid)
+        side = "long" if entry["is_buy"] else "short"
+        logger.info(f"ENTRY {entry['coin']} {side} filled (ws) size={entry['hl_size']}")
     finally:
         save_state(state)
 
@@ -253,46 +262,81 @@ def retry_unmirrored(state):
         state["snapshot"].pop(tid, None)
     if retry:
         save_state(state)
-        logger.info("startup: retrying %d previously unmirrored trades on first poll", len(retry))
+        logger.info(f"Retrying {len(retry)} unmirrored trades on first poll")
 
 
 def reconcile(client, state):
-    """Warn when tracked mirrored positions and actual exchange positions diverge."""
+    """Warn when tracked mirrored positions and actual exchange positions
+    diverge. Untracked exchange positions are handled separately by
+    confirm_foreign_positions."""
     exchange = client.open_positions()
-    tracked = {e["coin"] for e in state["mirrored"].values() if e["mirrored"]}
-    for coin in sorted(set(exchange) - tracked):
-        logger.warning("reconcile: untracked %s position on exchange (size %s) - "
-                       "not managed by the bot, opens on this coin will be skipped",
-                       coin, exchange[coin])
-    for coin in sorted(tracked - set(exchange)):
-        logger.warning("reconcile: tracked %s position missing on exchange "
-                       "(TP/SL fired or closed manually?)", coin)
+    for coin in sorted(tracked_coins(state) - set(exchange)):
+        logger.warning(f"Reconcile {coin} tracked but missing on exchange "
+                       "(TP/SL fired or closed manually?)")
+
+
+def confirm_foreign_positions(client, state, ask=input):
+    """Print the trading capital the bot will use and the positions that count
+    as foreign (on the exchange but not opened by the bot): they are never
+    traded, and the bot's capital is what remains after their isolated margin.
+    Always asks the user to confirm the capital; returns False to abort startup."""
+    breakdown = client.position_breakdown()
+    sizes = client.open_positions()
+    # A pending entry trigger that fired while the bot was down leaves a
+    # position the first poll will promote - it's ours, not foreign
+    pending_fills = {e["coin"] for e in state["mirrored"].values()
+                     if not e["mirrored"] and e.get("entry_oid") is not None
+                     and sizes.get(e["coin"])
+                     and (sizes[e["coin"]] > 0) == e["is_buy"]}
+    foreign = set(breakdown) - tracked_coins(state) - pending_fills
+    available, total_notional, _ = client.margin_summary()
+    bot_av, bot_free, _ = adjust_for_foreign(
+        available, total_notional, breakdown, foreign)
+    if foreign:
+        print("\nPositions on the exchange not opened by the bot (foreign):")
+        for coin in sorted(foreign):
+            b = breakdown[coin]
+            print(f"  {coin:8} size={sizes[coin]} notional=${b['notional']:.2f} "
+                  f"margin=${b['margin']:.2f} uPnL=${b['upnl']:+.2f}")
+        print(f"Bot trading capital: ${bot_av:.2f} (available balance: ${bot_free:.2f})")
+        print("NOTE: foreign positions must use ISOLATED margin.")
+        prompt = "Ignore these positions and trade only with the remaining capital? [y/N] "
+    else:
+        print(f"\nNo foreign positions on the exchange.\n"
+              f"Bot trading capital: ${bot_av:.2f} (available balance: ${bot_free:.2f})")
+        prompt = "Trade with this capital? [y/N] "
+    if ask(prompt).strip().lower() not in ("y", "yes"):
+        logger.info("Trading capital not confirmed, exiting")
+        return False
+    logger.info(f"Bot capital {bot_av:.2f} confirmed, "
+                f"foreign positions {sorted(foreign) or 'none'}")
+    return True
 
 
 def poll_once(client, state, portfolio_id, jwt_token):
     trades = fetch_open_trades(portfolio_id, jwt_token, size=100)
     curr = {str(t["id"]): t for t in trades}
 
-    logger.info("poll: %d open target trades", len(curr))
+    logger.info(f"Poll {len(curr)} open target trades")
     # Backstop for the websocket: promote any entry trigger that filled since
     # the last poll before diffing, so a same-poll close sees it as mirrored.
     # In dry-run orders never rest on the exchange, so there's nothing to sweep
     if not config.DRY_RUN:
         check_pending_entries(client, state)
     opens, closes = diff_snapshots(state["snapshot"], curr)
-    logger.debug("events: %d open, %d close", len(opens), len(closes))
+    logger.debug(f"Events {len(opens)} open, {len(closes)} close")
 
     for trade in opens:
         try:
             handle_open(client, state, trade)
-        except OrderError:
-            logger.exception("failed to mirror open of trade %s", trade["id"])
+        except OrderError as e:
+            logger.error(f"OPEN {normalize_ticker(trade['ticker'])} failed: {e}")
         save_state(state)
     for trade in closes:
         try:
             handle_close(client, state, trade)
-        except OrderError:
-            logger.exception("failed to mirror close of trade %s", trade["id"])
+        except OrderError as e:
+            logger.error(f"CLOSE {normalize_ticker(trade['ticker'])} failed: {e}")
         save_state(state)
 
     state["snapshot"] = curr
@@ -311,11 +355,12 @@ def main():
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[console, log_file],
     )
     for noisy in ("urllib3", "requests", "websockets"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    logger.info("starting mirror bot (dry_run=%s, poll=%ss)", config.DRY_RUN, config.POLL_INTERVAL_S)
+    logger.info(f"Starting mirror bot dry_run={config.DRY_RUN} poll={config.POLL_INTERVAL_S}s")
 
     portfolio_id = os.environ["PORTFOLIO_ID"]
     jwt_token = os.environ["INVOAPP_JWT"]
@@ -329,16 +374,17 @@ def main():
         # Empty snapshot: every currently open target position shows up as an
         # "open" event on the first poll and gets mirrored
         state = {"snapshot": {}, "mirrored": {}}
-        logger.info("no saved state at %s: existing target positions will be mirrored on first poll",
-                    config.OPEN_POSITIONS_PATH)
+        logger.info(f"No saved state at {config.OPEN_POSITIONS_PATH}, existing "
+                    "target positions will be mirrored on first poll")
     else:
-        logger.info("loaded state from %s: %d tracked positions",
-                    config.OPEN_POSITIONS_PATH, len(state["mirrored"]))
+        logger.info(f"Loaded {len(state['mirrored'])} tracked positions")
         retry_unmirrored(state)
     if not config.DRY_RUN:
         # Dry-run never places orders, so tracked state and the exchange are
         # unrelated and comparing them would only produce false warnings
         reconcile(client, state)
+        if not confirm_foreign_positions(client, state):
+            return
 
     while True:
         try:
@@ -346,18 +392,18 @@ def main():
         except requests.HTTPError as e:
             if _jwt_expired(e):
                 return
-            logger.exception("invoapp request failed, retrying in %ss", config.RETRY_DELAY_S)
+            logger.exception(f"Invoapp request failed, retrying in {config.RETRY_DELAY_S}s")
             time.sleep(config.RETRY_DELAY_S)
             try:
                 state = poll_once(client, state, portfolio_id, jwt_token)
             except requests.HTTPError as e2:
                 if _jwt_expired(e2):
                     return
-                logger.exception("retry failed, waiting for next poll")
+                logger.exception("Retry failed, waiting for next poll")
             except Exception:
-                logger.exception("retry failed, waiting for next poll")
+                logger.exception("Retry failed, waiting for next poll")
         except Exception:
-            logger.exception("poll failed, retrying next poll")
+            logger.exception("Poll failed, retrying next poll")
         # Wait for the next poll, but wake within ~1s of a websocket fill so
         # TP/SL go out immediately instead of up to a full poll later. With no
         # fills this degrades to a plain sleep until the deadline
@@ -373,17 +419,20 @@ def main():
             try:
                 handle_fill(client, state, fill)
             except Exception:
-                logger.exception("failed to handle websocket fill %s", fill)
+                logger.exception(f"Fill {fill.get('coin')} handling failed")
 
 
 def _jwt_expired(e):
     if e.response is None or e.response.status_code != 401:
         return False
-    msg = f"invoapp JWT expired or invalid - renew INVOAPP_JWT in {config.SECRETS_PATH} and restart"
+    msg = f"Invoapp JWT expired or invalid - renew INVOAPP_JWT in {config.SECRETS_PATH} and restart"
     logger.error(msg)
     print(f"\n!!! {msg} !!!")
     return True
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Mirror bot interrupted, remember positions still open on exchange")
