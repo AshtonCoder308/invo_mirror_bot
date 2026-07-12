@@ -14,16 +14,25 @@ BASE_URL = constants.TESTNET_API_URL
 POLL_INTERVAL_S = 120
 RETRY_DELAY_S = 10  # quick retry after a transient invoapp error before waiting a full poll
 
-# Placeholder sizing: fixed margin per mirrored trade (notional = margin * leverage).
-# Later: proportional to account equity vs target portfolio equity from invoapp.
-FIXED_MARGIN_USD = 100.0
+# Dynamic sizing: each new trade's margin is an equal slice of total account
+# value (unrealized PnL included), or whatever free margin is left if that's less.
+MAX_OPEN_TRADES = 3
+
+# Risk controls (phase 3). The notional caps apply to every open.
+MAX_POSITION_NOTIONAL_USD = 20_000.0  # hard cap on any single position's notional
+MAX_ACCOUNT_LEVERAGE = 10.0           # cap on total open notional / account value
 
 SLIPPAGE = 0.01
 
-# invoapp's positionSize is mark-to-market, so it drifts with price every poll.
-# Only mirror a resize when it moved this far (relative) from the size we last
-# scaled to; smaller changes are treated as price noise.
-RESIZE_THRESHOLD = 0.05
+# Hyperliquid coin names (e.g. "BTC") never mirrored even when the target
+# trades them; the trade is tracked as mirrored=False so it isn't retried.
+IGNORED_COINS = set()
+
+# Entries rest as trigger-market orders placed this far beyond the target's
+# entry price, in our favor (long: 0.5% below, short: 0.5% above). If the
+# price never reaches the trigger, the trade is never entered.
+ENTRY_IMPROVEMENT = 0.005
+
 MAX_LEVERAGE = 10          # cap regardless of the target's leverage
 MIN_NOTIONAL_USD = 10.0    # Hyperliquid minimum order size
 

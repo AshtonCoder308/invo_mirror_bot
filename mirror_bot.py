@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import queue
 import time
 
 import requests
@@ -43,18 +44,29 @@ def save_state(state):
 
 
 def diff_snapshots(prev, curr):
-    """Compare trade-id-keyed snapshots. Returns (opens, closes, resizes);
-    resizes are (old_trade, new_trade) pairs."""
+    """Compare trade-id-keyed snapshots. Returns (opens, closes). Target
+    resizes are deliberately not mirrored: once opened, our position only
+    changes via a full close."""
     opens = [t for tid, t in curr.items() if tid not in prev]
     closes = [t for tid, t in prev.items() if tid not in curr]
-    resizes = [
-        (prev[tid], t)
-        for tid, t in curr.items()
-        if tid in prev
-        and prev[tid].get("position_size")
-        and t.get("position_size") != prev[tid].get("position_size")
-    ]
-    return opens, closes, resizes
+    return opens, closes
+
+
+def allocate_margin(account_value, free_margin, total_notional, leverage):
+    """Risk-checked margin for a new trade, or None when the trade is rejected.
+
+    Each trade gets an equal slice of account value (account_value /
+    MAX_OPEN_TRADES); when free margin can't cover a full slice, whatever is
+    left gets invested instead. The implied notional is then clamped by the
+    per-position cap and the account-wide leverage cap, and the trade is
+    rejected outright if what survives is below the exchange minimum."""
+    margin = min(account_value / config.MAX_OPEN_TRADES, free_margin)
+    notional = min(margin * leverage,
+                   config.MAX_POSITION_NOTIONAL_USD,
+                   account_value * config.MAX_ACCOUNT_LEVERAGE - total_notional)
+    if notional < config.MIN_NOTIONAL_USD:
+        return None
+    return notional / leverage
 
 
 def handle_open(client, state, trade):
@@ -66,44 +78,87 @@ def handle_open(client, state, trade):
     coin = normalize_ticker(trade["ticker"])
     entry = {"coin": coin, "is_buy": trade["direction"] == "long", "mirrored": False,
              "hl_size": 0, "leverage": trade.get("leverage") or 1, "tpsl_oids": [],
-             "target_size": trade["position_size"]}
+             "entry_oid": None, "tp_px": trade.get("price_target"),
+             "sl_px": trade.get("stop_loss")}
+    # Track the entry before any order goes out: poll_once persists state even
+    # when a handler raises, so a failure mid-open must not leave an order or
+    # position on the exchange untracked
+    state["mirrored"][tid] = entry
+    if coin in config.IGNORED_COINS:
+        logger.info("OPEN %s: %s is in IGNORED_COINS, skipping", tid, coin)
+        return
     if not client.is_listed(coin):
         logger.warning("skip %s (%s, asset_type=%s): %s not listed on Hyperliquid",
                        tid, trade["ticker"], trade.get("asset_type"), coin)
-    else:
-        szi = client.open_positions().get(coin)
-        if szi and (szi > 0) == entry["is_buy"]:
-            # Exchange already holds this coin in the right direction (lost
-            # state file, manual trade, ...): adopt it instead of doubling up -
-            # a second order would just merge into the same position anyway
-            entry["hl_size"] = abs(szi)
-            entry["mirrored"] = True
-            entry["tpsl_oids"] = client.place_tpsl(
-                coin, entry["is_buy"], entry["hl_size"],
-                trade.get("price_target"), trade.get("stop_loss"))
-            logger.warning("OPEN %s: adopted existing %s position (size %s) instead of opening",
-                           tid, coin, szi)
-        else:
-            if szi:
-                # Exchange holds the coin in the wrong direction: flip it to
-                # match the portfolio - close everything, then open fresh
-                logger.warning("OPEN %s: closing opposite-direction %s position (size %s) "
-                               "to match portfolio", tid, coin, szi)
-                client.close_position(coin)
-            size = client.open_position(coin, entry["is_buy"], config.FIXED_MARGIN_USD, entry["leverage"])
-            entry["hl_size"] = size
-            entry["mirrored"] = True
-            entry["tpsl_oids"] = client.place_tpsl(
-                coin, entry["is_buy"], size, trade.get("price_target"), trade.get("stop_loss"))
-            logger.info("OPEN mirrored: %s %s (invoapp trade %s)",
-                        coin, "long" if entry["is_buy"] else "short", tid)
-    state["mirrored"][tid] = entry
+        return
+    szi = client.open_positions().get(coin)
+    if szi:
+        # Never touch a position the bot didn't open, in either direction:
+        # warn and leave it alone (mirrored stays False)
+        logger.warning("OPEN %s: exchange already holds %s (size %s) not opened by "
+                       "the bot, skipping - resolve manually", tid, coin, szi)
+        return
+    lev = min(entry["leverage"], config.MAX_LEVERAGE)
+    account_value, total_notional, margin_used = client.margin_summary()
+    margin = allocate_margin(account_value, account_value - margin_used, total_notional, lev)
+    if margin is None:
+        logger.warning("OPEN %s: rejected by risk limits - no capital left for %s "
+                       "(account %.2f, free %.2f, open notional %.2f)",
+                       tid, coin, account_value, account_value - margin_used, total_notional)
+        return
+    # Enter at ENTRY_IMPROVEMENT beyond the target's entry, in our favor
+    # (long: below, short: above)
+    improve = 1 - config.ENTRY_IMPROVEMENT if entry["is_buy"] else 1 + config.ENTRY_IMPROVEMENT
+    trigger_px = trade["entry_price"] * improve
+    mid = client.mid(coin)
+    already_better = mid <= trigger_px if entry["is_buy"] else mid >= trigger_px
+    side = "long" if entry["is_buy"] else "short"
+    if already_better:
+        # Price is already past the trigger - the exchange would reject the
+        # trigger order as "would trigger immediately". Take the even better
+        # entry at market and guard it right away
+        size = client.open_position(coin, entry["is_buy"], margin, lev)
+        entry["hl_size"] = size
+        entry["mirrored"] = True
+        entry["tpsl_oids"] = client.place_tpsl(coin, entry["is_buy"], size,
+                                               entry["tp_px"], entry["sl_px"])
+        logger.info("OPEN mirrored at market: %s %s size=%s (price %s already beyond "
+                    "trigger %s) (invoapp trade %s)", coin, side, size, mid, trigger_px, tid)
+        return
+    # Rest the trigger; mirrored stays False until it fills - TP/SL are
+    # reduce-only and need a position to exist first
+    size = client.round_size(coin, margin * lev / trigger_px)
+    if size <= 0:
+        raise OrderError(f"{coin}: size rounds to 0")
+    entry["entry_oid"] = client.place_entry_trigger(coin, entry["is_buy"], size, trigger_px, lev)
+    logger.info("OPEN trigger placed: %s %s size=%s trigger=%s (invoapp trade %s)",
+                coin, side, size, trigger_px, tid)
 
 
 def handle_close(client, state, trade):
     tid = str(trade["id"])
     entry = state["mirrored"].pop(tid, None)
-    if not entry or not entry["mirrored"]:
+    if not entry:
+        logger.debug("CLOSE %s: was not tracked, nothing to do", tid)
+        return
+    if entry.get("entry_oid") is not None:
+        # Entry trigger never promoted: cancel it (the trade was never
+        # entered). If it fired between polls, a position exists and must be
+        # closed like a mirrored one; skipped in dry-run where orders and
+        # positions never exist on the exchange
+        client.cancel_orders(entry["coin"], [entry["entry_oid"]])
+        if not config.DRY_RUN:
+            szi = client.open_positions().get(entry["coin"])
+            if szi and (szi > 0) == entry["is_buy"]:
+                client.cancel_orders(entry["coin"], entry["tpsl_oids"])
+                client.close_position(entry["coin"], abs(szi))
+                logger.warning("CLOSE %s: entry trigger for %s had fired between polls, "
+                               "closed the position", tid, entry["coin"])
+                return
+        logger.info("CLOSE %s: cancelled resting entry trigger for %s (never filled)",
+                    tid, entry["coin"])
+        return
+    if not entry["mirrored"]:
         logger.debug("CLOSE %s: was not mirrored, nothing to do", tid)
         return
     # In dry-run mirrored positions never exist on the exchange, so the check
@@ -120,33 +175,85 @@ def handle_close(client, state, trade):
     logger.info("CLOSE mirrored: %s (invoapp trade %s)", entry["coin"], tid)
 
 
-def handle_resize(client, state, old_trade, new_trade):
-    tid = str(new_trade["id"])
-    entry = state["mirrored"].get(tid)
-    if not entry or not entry["mirrored"]:
+def promote_entry(client, entry, size):
+    """A resting entry trigger filled: record the position and guard it with
+    TP/SL. mirrored/hl_size are set before place_tpsl so a rejected trigger
+    still leaves the position tracked when the caller persists state."""
+    entry["hl_size"] = size
+    entry["mirrored"] = True
+    entry["entry_oid"] = None
+    entry["tpsl_oids"] = client.place_tpsl(
+        entry["coin"], entry["is_buy"], size, entry.get("tp_px"), entry.get("sl_px"))
+
+
+def check_pending_entries(client, state):
+    """Poll-time backstop for the websocket: promote entries whose resting
+    entry trigger has filled; an oid that vanished without producing a
+    position was cancelled externally and stays unmirrored (never retried)."""
+    pending = {tid: e for tid, e in state["mirrored"].items()
+               if not e["mirrored"] and e.get("entry_oid") is not None}
+    if not pending:
         return
-    coin = entry["coin"]
-    # Compare against the target size we last scaled to, not the previous poll:
-    # positionSize is mark-to-market, so poll-to-poll it always differs a little.
-    # Noise oscillates around the baseline; deliberate scaling accumulates past it.
-    baseline = entry.setdefault("target_size", old_trade["position_size"])
-    ratio = new_trade["position_size"] / baseline
-    if abs(ratio - 1) < config.RESIZE_THRESHOLD:
-        logger.debug("RESIZE %s: %.2f%% change below threshold, treated as price noise",
-                     coin, (ratio - 1) * 100)
+    resting = client.open_orders()
+    positions = client.open_positions()
+    for tid, entry in pending.items():
+        if entry["entry_oid"] in resting:
+            continue  # price hasn't reached the trigger yet
+        try:
+            szi = positions.get(entry["coin"])
+            if szi and (szi > 0) == entry["is_buy"]:
+                promote_entry(client, entry, abs(szi))
+                logger.info("ENTRY filled: %s %s size=%s (invoapp trade %s)",
+                            entry["coin"], "long" if entry["is_buy"] else "short",
+                            entry["hl_size"], tid)
+            else:
+                entry["entry_oid"] = None
+                logger.warning("ENTRY %s: trigger for %s gone without a fill "
+                               "(cancelled externally?) - trade stays unmirrored",
+                               tid, entry["coin"])
+        except OrderError:
+            logger.exception("failed to promote filled entry of trade %s", tid)
+        save_state(state)
+
+
+def handle_fill(client, state, fill):
+    """Websocket fill dequeued on the main thread: promote the matching entry
+    within ~1s instead of waiting for the next poll's backstop sweep."""
+    oid = fill.get("oid")
+    match = next(((tid, e) for tid, e in state["mirrored"].items()
+                  if not e["mirrored"] and e.get("entry_oid") == oid), None)
+    if match is None:
+        # TP/SL executions and manual trades land here; the poll-time
+        # close/reconcile logic picks those up
+        logger.debug("fill oid %s (%s) matches no pending entry, ignoring",
+                     oid, fill.get("coin"))
         return
-    new_size = client.round_size(coin, entry["hl_size"] * ratio)
-    delta = new_size - entry["hl_size"]
-    if abs(delta) * client.mid(coin) < config.MIN_NOTIONAL_USD:
-        logger.debug("RESIZE %s: delta %s below minimum notional, skipped", coin, delta)
-        return
-    if delta > 0:
-        client.increase_position(coin, entry["is_buy"], delta)
-    else:
-        client.close_position(coin, -delta)
-    entry["hl_size"] = new_size
-    entry["target_size"] = new_trade["position_size"]
-    logger.info("RESIZE mirrored: %s %s -> %s (invoapp trade %s)", coin, entry["hl_size"] - delta, new_size, tid)
+    tid, entry = match
+    try:
+        # The actual position beats the fill's sz (a merged or partial fill
+        # would make them differ)
+        szi = client.open_positions().get(entry["coin"])
+        promote_entry(client, entry, abs(szi) if szi else float(fill["sz"]))
+        logger.info("ENTRY filled (ws): %s %s size=%s (invoapp trade %s)",
+                    entry["coin"], "long" if entry["is_buy"] else "short",
+                    entry["hl_size"], tid)
+    finally:
+        save_state(state)
+
+
+def retry_unmirrored(state):
+    """Drop unmirrored entries with no resting trigger (risk-rejected, skipped,
+    vanished orders) from state at startup: the first poll then replays them
+    through handle_open, which re-applies every guard under fresh conditions.
+    Entries with a resting trigger or an open position are left alone."""
+    retry = [tid for tid, e in state["mirrored"].items()
+             if not e["mirrored"] and e.get("entry_oid") is None]
+    for tid in retry:
+        del state["mirrored"][tid]
+        state["snapshot"].pop(tid, None)
+    if retry:
+        save_state(state)
+        logger.info("startup: retrying %d previously unmirrored trades on first poll", len(retry))
 
 
 def reconcile(client, state):
@@ -155,7 +262,7 @@ def reconcile(client, state):
     tracked = {e["coin"] for e in state["mirrored"].values() if e["mirrored"]}
     for coin in sorted(set(exchange) - tracked):
         logger.warning("reconcile: untracked %s position on exchange (size %s) - "
-                       "not managed by the bot, opens on this coin will halt",
+                       "not managed by the bot, opens on this coin will be skipped",
                        coin, exchange[coin])
     for coin in sorted(tracked - set(exchange)):
         logger.warning("reconcile: tracked %s position missing on exchange "
@@ -167,8 +274,13 @@ def poll_once(client, state, portfolio_id, jwt_token):
     curr = {str(t["id"]): t for t in trades}
 
     logger.info("poll: %d open target trades", len(curr))
-    opens, closes, resizes = diff_snapshots(state["snapshot"], curr)
-    logger.debug("events: %d open, %d close, %d resize", len(opens), len(closes), len(resizes))
+    # Backstop for the websocket: promote any entry trigger that filled since
+    # the last poll before diffing, so a same-poll close sees it as mirrored.
+    # In dry-run orders never rest on the exchange, so there's nothing to sweep
+    if not config.DRY_RUN:
+        check_pending_entries(client, state)
+    opens, closes = diff_snapshots(state["snapshot"], curr)
+    logger.debug("events: %d open, %d close", len(opens), len(closes))
 
     for trade in opens:
         try:
@@ -181,12 +293,6 @@ def poll_once(client, state, portfolio_id, jwt_token):
             handle_close(client, state, trade)
         except OrderError:
             logger.exception("failed to mirror close of trade %s", trade["id"])
-        save_state(state)
-    for old_trade, new_trade in resizes:
-        try:
-            handle_resize(client, state, old_trade, new_trade)
-        except OrderError:
-            logger.exception("failed to mirror resize of trade %s", new_trade["id"])
         save_state(state)
 
     state["snapshot"] = curr
@@ -213,7 +319,11 @@ def main():
 
     portfolio_id = os.environ["PORTFOLIO_ID"]
     jwt_token = os.environ["INVOAPP_JWT"]
-    client = HLClient()
+    # The websocket handler runs on its own thread and must only enqueue;
+    # fills are dequeued and handled on this thread between polls. In dry-run
+    # no orders rest on the exchange, so there are no fills to react to
+    fills = queue.Queue()
+    client = HLClient(on_fill=None if config.DRY_RUN else fills.put)
     state = load_state()
     if state is None:
         # Empty snapshot: every currently open target position shows up as an
@@ -224,6 +334,7 @@ def main():
     else:
         logger.info("loaded state from %s: %d tracked positions",
                     config.OPEN_POSITIONS_PATH, len(state["mirrored"]))
+        retry_unmirrored(state)
     if not config.DRY_RUN:
         # Dry-run never places orders, so tracked state and the exchange are
         # unrelated and comparing them would only produce false warnings
@@ -247,7 +358,22 @@ def main():
                 logger.exception("retry failed, waiting for next poll")
         except Exception:
             logger.exception("poll failed, retrying next poll")
-        time.sleep(config.POLL_INTERVAL_S)
+        # Wait for the next poll, but wake within ~1s of a websocket fill so
+        # TP/SL go out immediately instead of up to a full poll later. With no
+        # fills this degrades to a plain sleep until the deadline
+        deadline = time.monotonic() + config.POLL_INTERVAL_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                fill = fills.get(timeout=remaining)
+            except queue.Empty:
+                break
+            try:
+                handle_fill(client, state, fill)
+            except Exception:
+                logger.exception("failed to handle websocket fill %s", fill)
 
 
 def _jwt_expired(e):

@@ -24,10 +24,12 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
   - Fixed ratio of target's position size
   - Fixed dollar allocation per trade
   - Proportional to your account equity vs the target's equity
+  - (implemented: equal slices of own account value — each trade's margin is account value / `MAX_OPEN_TRADES`, or the remaining free margin if that's less)
 - Map target's asset, side, size, and leverage to an equivalent order on your account (convert invoapp USD position size to coin units, rounded to the asset's `szDecimals`)
 - Choose order type: market (speed) vs limit (price control) and set slippage tolerance
+  - (decision: entries rest as trigger-market orders at `ENTRY_IMPROVEMENT` (0.5%) beyond the target's entry price in our favor; if the price never gets there, the trade is never entered and the trigger is cancelled when the target closes. Fills are reacted to within ~1s via the `userFills` websocket, with the poll as backstop)
 - Handle edge cases:
-  - Position increases and decreases (scaling in/out)
+  - Position increases and decreases (scaling in/out) — (decision: not mirrored at all; once opened, our position only changes via a full close)
   - Leverage mismatches between your account and theirs
   - Full position closes
   - Positions opened before the bot started (decision: mirror existing positions on first start; tracked state is persisted to `open_positions.json` so restarts resume without re-mirroring)
@@ -37,11 +39,13 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
 
 ## Phase 3: Risk Controls (build before any live testing)
 
-- Max position size per asset
-- Max total exposure / account-wide leverage cap
-- Daily loss limit that automatically halts the bot
-- Reject trades if mirrored size implies unrealistic leverage for your account balance
-- Full logging of every signal received and every order sent (timestamp, size, price, response)
+- [x] Max position size per asset (`MAX_POSITION_NOTIONAL_USD` caps every open and resize increase)
+- [x] Max total exposure / account-wide leverage cap (total open notional capped at `MAX_ACCOUNT_LEVERAGE` × account value)
+- Daily loss limit that automatically halts the bot — implemented in phase 3, then removed by decision on 2026-07-11 (no automated equity halt; manual kill switch only)
+- [x] Reject trades if mirrored size implies unrealistic leverage for your account balance (per-trade margin = min(account value / `MAX_OPEN_TRADES`, free margin), rejected when the surviving notional is below `MIN_NOTIONAL_USD`)
+- [x] Never touch positions the bot didn't open — an open on a coin the exchange already holds (either direction) is skipped with a warning
+- [x] `IGNORED_COINS` — configurable set of coins never mirrored even when the target trades them
+- [x] Full logging of every signal received and every order sent (timestamp, size, price, response)
 
 ---
 
@@ -84,7 +88,7 @@ This bot mirrors the perp futures positions of a target invoapp portfolio onto H
 - [x] Testnet account funded via faucet
 - [x] SDK installed
 - [x] Mirror logic built and mapped to target invoapp portfolio (`mirror_bot.py`; dry-run verified, live testnet validation pending)
-- [ ] Risk controls implemented (position cap, leverage cap, daily loss limit)
+- [x] Risk controls implemented (position cap, leverage cap)
 - [x] Logging in place for signals and orders (console + `logs/mirror.log`)
 - [ ] Testnet run completed, failure modes tested
 - [ ] Mainnet dry run at minimum size completed
