@@ -66,17 +66,16 @@ def allocate_margin(account_value, free_margin, total_notional, leverage):
     return notional / leverage
 
 
-def adjust_for_foreign(account_value, total_notional, margin_used, breakdown, foreign_coins):
-    """Capital figures with foreign positions stripped out, so the bot only
-    plays with what isn't tied up in positions it didn't open. Foreign trades
-    must run on isolated margin: an isolated position's marginUsed is its own
-    margin balance and already absorbs its unrealized PnL, so subtracting it
-    removes both the position's capital and its PnL swings in one term."""
-    f_margin = sum(breakdown[c]["margin"] for c in foreign_coins)
+def adjust_for_foreign(available, total_notional, breakdown, foreign_coins):
+    """(bot_capital, free_margin, bot_notional) for sizing. The exchange's
+    available balance already excludes everything held by positions - foreign
+    and ours - via the spot hold, so foreign trades cost the bot nothing extra;
+    the bot's own positions' margin is added back so the per-trade slice
+    (capital / MAX_OPEN_TRADES) stays a share of all bot money, not just what's
+    left. Foreign notional is stripped so it doesn't eat the leverage cap."""
+    bot_margin = sum(b["margin"] for c, b in breakdown.items() if c not in foreign_coins)
     f_notional = sum(breakdown[c]["notional"] for c in foreign_coins)
-    bot_av = account_value - f_margin
-    bot_free = bot_av - (margin_used - f_margin)  # == the account's real free margin
-    return bot_av, bot_free, total_notional - f_notional
+    return available + bot_margin, available, total_notional - f_notional
 
 
 def tracked_coins(state):
@@ -112,11 +111,11 @@ def handle_open(client, state, trade):
                        "by bot, resolve manually")
         return
     lev = min(entry["leverage"], config.MAX_LEVERAGE)
-    account_value, total_notional, margin_used = client.margin_summary()
+    available, total_notional, _ = client.margin_summary()
     breakdown = client.position_breakdown()
     foreign = set(breakdown) - tracked_coins(state)
     bot_av, bot_free, bot_notional = adjust_for_foreign(
-        account_value, total_notional, margin_used, breakdown, foreign)
+        available, total_notional, breakdown, foreign)
     margin = allocate_margin(bot_av, bot_free, bot_notional, lev)
     if margin is None:
         logger.warning(f"OPEN {coin} rejected by risk limits "
@@ -290,21 +289,21 @@ def confirm_foreign_positions(client, state, ask=input):
                      and sizes.get(e["coin"])
                      and (sizes[e["coin"]] > 0) == e["is_buy"]}
     foreign = set(breakdown) - tracked_coins(state) - pending_fills
-    account_value, total_notional, margin_used = client.margin_summary()
+    available, total_notional, _ = client.margin_summary()
     bot_av, bot_free, _ = adjust_for_foreign(
-        account_value, total_notional, margin_used, breakdown, foreign)
+        available, total_notional, breakdown, foreign)
     if foreign:
         print("\nPositions on the exchange not opened by the bot (foreign):")
         for coin in sorted(foreign):
             b = breakdown[coin]
             print(f"  {coin:8} size={sizes[coin]} notional=${b['notional']:.2f} "
                   f"margin=${b['margin']:.2f} uPnL=${b['upnl']:+.2f}")
-        print(f"Bot trading capital: ${bot_av:.2f} (free margin available: ${bot_free:.2f})")
+        print(f"Bot trading capital: ${bot_av:.2f} (available balance: ${bot_free:.2f})")
         print("NOTE: foreign positions must use ISOLATED margin.")
         prompt = "Ignore these positions and trade only with the remaining capital? [y/N] "
     else:
         print(f"\nNo foreign positions on the exchange.\n"
-              f"Bot trading capital: ${bot_av:.2f} (free margin available: ${bot_free:.2f})")
+              f"Bot trading capital: ${bot_av:.2f} (available balance: ${bot_free:.2f})")
         prompt = "Trade with this capital? [y/N] "
     if ask(prompt).strip().lower() not in ("y", "yes"):
         logger.info("Trading capital not confirmed, exiting")

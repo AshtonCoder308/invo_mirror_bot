@@ -23,7 +23,7 @@ class StubClient:
         self.orders = []
         self.positions = positions or {}  # what the fake exchange already holds
         self.resting = set()  # oids of orders still resting on the fake exchange
-        self.account = account  # (account_value, total_notional, margin_used)
+        self.account = account  # (available, total_notional, margin_used)
         self.breakdown = breakdown or {}  # coin -> {margin, notional, upnl}
 
     def is_listed(self, coin):
@@ -232,9 +232,9 @@ def test_retry_unmirrored_drops_stuck_entries_at_startup():
 
 
 def test_open_rejected_by_risk_limits_not_retried():
-    # Free margin ($5) is below the minimum notional: reject, but still track
-    # the trade (mirrored=False) so it isn't retried every poll
-    client = StubClient(account=(30.0, 5.0, 25.0))
+    # Available balance ($5) implies a notional below the minimum: reject, but
+    # still track the trade (mirrored=False) so it isn't retried every poll
+    client = StubClient(account=(5.0, 0.0, 0.0))
     state = {"mirrored": {}}
     handle_open(client, state, trade("1"))
     assert not client.orders
@@ -410,33 +410,34 @@ def test_allocate_margin_caps_account_leverage():
         config.MAX_ACCOUNT_LEVERAGE = orig
 
 
-def test_adjust_for_foreign_strips_margin_and_notional():
-    # Foreign ETH: isolated margin 300, notional 900. Account: AV 1000,
-    # notional 1200, margin used 400 (300 foreign + 100 bot)
+def test_adjust_for_foreign_capital_from_available():
+    # Available balance 600 (exchange already held back both positions'
+    # margin); the bot's own BTC margin (100) is added back so the per-trade
+    # slice stays a share of all bot money. Foreign ETH costs nothing extra.
     breakdown = {"ETH": {"margin": 300.0, "notional": 900.0, "upnl": 50.0},
                  "BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}}
     bot_av, bot_free, bot_notional = adjust_for_foreign(
-        1000.0, 1200.0, 400.0, breakdown, {"ETH"})
-    assert bot_av == 700.0        # 1000 minus foreign isolated margin
-    assert bot_free == 600.0      # bot capital 700 minus bot margin used 100
+        600.0, 1200.0, breakdown, {"ETH"})
+    assert bot_av == 700.0        # available + bot's own margin
+    assert bot_free == 600.0      # spendable = the exchange's available balance
     assert bot_notional == 300.0  # foreign notional doesn't count against leverage
 
 
-def test_adjust_for_foreign_ignores_upnl():
-    # Foreign positions must be isolated: marginUsed already absorbs their
-    # uPnL, so the uPnL figure itself must not change the bot's capital
+def test_adjust_for_foreign_upnl_irrelevant():
+    # The hold behind the available balance already tracks the positions'
+    # buckets; the uPnL figures themselves must not change the result
     for upnl in (50.0, -50.0):
         breakdown = {"ETH": {"margin": 300.0, "notional": 900.0, "upnl": upnl},
                      "BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}}
-        assert adjust_for_foreign(1000.0, 1200.0, 400.0, breakdown, {"ETH"}) \
+        assert adjust_for_foreign(600.0, 1200.0, breakdown, {"ETH"}) \
             == (700.0, 600.0, 300.0)
 
 
 def test_open_allocates_from_bot_capital_only():
-    # AV 3000 but 1000 margin / 10000 notional sit in a foreign ETH position:
-    # the slice comes from the remaining 2000, not the full account
+    # Available balance 2000; a foreign ETH position holds 1000 margin /
+    # 10000 notional. The slice comes from the available 2000 only
     breakdown = {"ETH": {"margin": 1000.0, "notional": 10000.0, "upnl": 0.0}}
-    client = StubClient(account=(3000.0, 10000.0, 1000.0), breakdown=breakdown)
+    client = StubClient(account=(2000.0, 10000.0, 1000.0), breakdown=breakdown)
     state = {"mirrored": {}}
     handle_open(client, state, trade("1"))
     kind, coin, size, trigger_px = client.orders[0]
@@ -448,7 +449,7 @@ def test_open_allocates_from_bot_capital_only():
     orig = config.MAX_ACCOUNT_LEVERAGE
     config.MAX_ACCOUNT_LEVERAGE = 2.0
     try:
-        client = StubClient(account=(3000.0, 10000.0, 1000.0), breakdown=breakdown)
+        client = StubClient(account=(2000.0, 10000.0, 1000.0), breakdown=breakdown)
         state = {"mirrored": {}}
         handle_open(client, state, trade("1"))
         assert client.orders and client.orders[0][0] == "entry_trigger"

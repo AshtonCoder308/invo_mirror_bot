@@ -83,21 +83,16 @@ class HLClient:
         return breakdown
 
     def margin_summary(self):
-        """(account_value, total_notional, margin_used) across the whole account.
-        On a unified account all USDC cash lives in the spot balance - the perp
-        clearinghouse's accountValue is the slice backing perp positions and is
-        already contained in the spot total (verified against the portfolio
-        endpoint 2026-07-12) - so total equity is spot USDC plus unrealized
-        PnL, never spot + accountValue, which double-counts."""
-        state = self.info.user_state(self.address)
-        ms = state["marginSummary"]
-        spot_usdc = sum(float(b["total"])
+        """(available, total_notional, margin_used). available is the unified
+        account's spendable USDC - the spot balance's total minus hold, which
+        is exactly the UI's "Available balance": the exchange already deducts
+        everything committed to positions (isolated buckets, cross usage,
+        resting-order holds) via the hold field."""
+        ms = self.info.user_state(self.address)["marginSummary"]
+        available = sum(float(b["total"]) - float(b["hold"])
                         for b in self.info.spot_user_state(self.address)["balances"]
                         if b["coin"] == "USDC")
-        upnl = sum(float(ap["position"]["unrealizedPnl"])
-                   for ap in state["assetPositions"])
-        return (spot_usdc + upnl,
-                float(ms["totalNtlPos"]), float(ms["totalMarginUsed"]))
+        return (available, float(ms["totalNtlPos"]), float(ms["totalMarginUsed"]))
 
     def mid(self, coin):
         return float(self.info.all_mids()[coin])
@@ -120,7 +115,9 @@ class HLClient:
         if config.DRY_RUN:
             logger.info(f"DRY RUN Open {coin} {side} size={size} lev={leverage}x")
             return size
-        self.exchange.update_leverage(leverage, coin)
+        # is_cross=False: bot positions run on isolated margin so each trade's
+        # risk is contained to its own bucket and never the shared balance
+        self.exchange.update_leverage(leverage, coin, is_cross=False)
         result = self.exchange.market_open(coin, is_buy, size, None, config.SLIPPAGE)
         logger.debug(f"Open {coin} response {result}")
         _check(result)
@@ -163,7 +160,9 @@ class HLClient:
             logger.info(f"DRY RUN Entry trigger {coin} {side} size={size} "
                         f"trigger={trigger_px} lev={leverage}x")
             return -1
-        self.exchange.update_leverage(leverage, coin)
+        # is_cross=False: bot positions run on isolated margin so each trade's
+        # risk is contained to its own bucket and never the shared balance
+        self.exchange.update_leverage(leverage, coin, is_cross=False)
         order_type = {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "tp"}}
         result = self.exchange.order(coin, is_buy, size, limit_px, order_type, reduce_only=False)
         logger.debug(f"Entry trigger {coin} response {result}")
