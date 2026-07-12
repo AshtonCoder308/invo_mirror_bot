@@ -69,6 +69,19 @@ class HLClient:
                 positions[ap["position"]["coin"]] = szi
         return positions
 
+    def position_breakdown(self):
+        """Coin -> margin used, notional and unrealized PnL for every open
+        position; lets the bot strip foreign positions out of its capital."""
+        state = self.info.user_state(self.address)
+        breakdown = {}
+        for ap in state["assetPositions"]:
+            pos = ap["position"]
+            if float(pos["szi"]):
+                breakdown[pos["coin"]] = {"margin": float(pos["marginUsed"]),
+                                          "notional": float(pos["positionValue"]),
+                                          "upnl": float(pos["unrealizedPnl"])}
+        return breakdown
+
     def margin_summary(self):
         """(account_value, total_notional, margin_used) across the whole account.
         account_value marks positions to market (unrealized PnL included) and

@@ -5,9 +5,10 @@ import tempfile
 
 import config
 from hl_client import OrderError
-from mirror_bot import (allocate_margin, check_pending_entries, diff_snapshots,
-                        handle_close, handle_fill, handle_open, load_state,
-                        normalize_ticker, retry_unmirrored, save_state)
+from mirror_bot import (adjust_for_foreign, allocate_margin, check_pending_entries,
+                        confirm_foreign_positions, diff_snapshots, handle_close,
+                        handle_fill, handle_open, load_state, normalize_ticker,
+                        retry_unmirrored, save_state)
 
 
 def trade(tid, size=100.0, direction="long", entry_price=100.0):
@@ -18,11 +19,12 @@ def trade(tid, size=100.0, direction="long", entry_price=100.0):
 class StubClient:
     """Records orders; prices every coin at $100 so sizes clear MIN_NOTIONAL_USD."""
 
-    def __init__(self, positions=None, account=(100_000.0, 0.0, 0.0)):
+    def __init__(self, positions=None, account=(100_000.0, 0.0, 0.0), breakdown=None):
         self.orders = []
         self.positions = positions or {}  # what the fake exchange already holds
         self.resting = set()  # oids of orders still resting on the fake exchange
         self.account = account  # (account_value, total_notional, margin_used)
+        self.breakdown = breakdown or {}  # coin -> {margin, notional, upnl}
 
     def is_listed(self, coin):
         return True
@@ -35,6 +37,9 @@ class StubClient:
 
     def margin_summary(self):
         return self.account
+
+    def position_breakdown(self):
+        return dict(self.breakdown)
 
     def round_size(self, coin, sz):
         return round(sz, 4)
@@ -403,6 +408,71 @@ def test_allocate_margin_caps_account_leverage():
         assert allocate_margin(3000.0, 3000.0, 6000.0, 1) is None
     finally:
         config.MAX_ACCOUNT_LEVERAGE = orig
+
+
+def test_adjust_for_foreign_strips_margin_and_notional():
+    # Foreign ETH: isolated margin 300, notional 900. Account: AV 1000,
+    # notional 1200, margin used 400 (300 foreign + 100 bot)
+    breakdown = {"ETH": {"margin": 300.0, "notional": 900.0, "upnl": 50.0},
+                 "BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}}
+    bot_av, bot_free, bot_notional = adjust_for_foreign(
+        1000.0, 1200.0, 400.0, breakdown, {"ETH"})
+    assert bot_av == 700.0        # 1000 minus foreign isolated margin
+    assert bot_free == 600.0      # bot capital 700 minus bot margin used 100
+    assert bot_notional == 300.0  # foreign notional doesn't count against leverage
+
+
+def test_adjust_for_foreign_ignores_upnl():
+    # Foreign positions must be isolated: marginUsed already absorbs their
+    # uPnL, so the uPnL figure itself must not change the bot's capital
+    for upnl in (50.0, -50.0):
+        breakdown = {"ETH": {"margin": 300.0, "notional": 900.0, "upnl": upnl},
+                     "BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}}
+        assert adjust_for_foreign(1000.0, 1200.0, 400.0, breakdown, {"ETH"}) \
+            == (700.0, 600.0, 300.0)
+
+
+def test_open_allocates_from_bot_capital_only():
+    # AV 3000 but 1000 margin / 10000 notional sit in a foreign ETH position:
+    # the slice comes from the remaining 2000, not the full account
+    breakdown = {"ETH": {"margin": 1000.0, "notional": 10000.0, "upnl": 0.0}}
+    client = StubClient(account=(3000.0, 10000.0, 1000.0), breakdown=breakdown)
+    state = {"mirrored": {}}
+    handle_open(client, state, trade("1"))
+    kind, coin, size, trigger_px = client.orders[0]
+    assert kind == "entry_trigger"
+    assert size == round(2000.0 / config.MAX_OPEN_TRADES / 99.5, 4)
+
+    # Foreign notional excluded from the account-leverage cap: 10000 foreign
+    # notional would leave no headroom at 2x on the full account
+    orig = config.MAX_ACCOUNT_LEVERAGE
+    config.MAX_ACCOUNT_LEVERAGE = 2.0
+    try:
+        client = StubClient(account=(3000.0, 10000.0, 1000.0), breakdown=breakdown)
+        state = {"mirrored": {}}
+        handle_open(client, state, trade("1"))
+        assert client.orders and client.orders[0][0] == "entry_trigger"
+    finally:
+        config.MAX_ACCOUNT_LEVERAGE = orig
+
+
+def test_confirm_foreign_positions():
+    breakdown = {"ETH": {"margin": 300.0, "notional": 900.0, "upnl": 50.0}}
+    client = StubClient(positions={"ETH": 2.0}, account=(1000.0, 900.0, 300.0),
+                        breakdown=breakdown)
+    state = {"mirrored": {}}
+    assert confirm_foreign_positions(client, state, ask=lambda _: "y") is True
+    assert confirm_foreign_positions(client, state, ask=lambda _: "n") is False
+    assert confirm_foreign_positions(client, state, ask=lambda _: "") is False
+
+    def never_ask(prompt):
+        raise AssertionError("prompted with no foreign positions")
+
+    # Bot-tracked positions aren't foreign: no prompt at all
+    client = StubClient(positions={"BTC": 1.0},
+                        breakdown={"BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}})
+    state = {"mirrored": {"1": mirrored_entry()}}
+    assert confirm_foreign_positions(client, state, ask=never_ask) is True
 
 
 def test_normalize_ticker():

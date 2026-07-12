@@ -66,6 +66,23 @@ def allocate_margin(account_value, free_margin, total_notional, leverage):
     return notional / leverage
 
 
+def adjust_for_foreign(account_value, total_notional, margin_used, breakdown, foreign_coins):
+    """Capital figures with foreign positions stripped out, so the bot only
+    plays with what isn't tied up in positions it didn't open. Foreign trades
+    must run on isolated margin: an isolated position's marginUsed is its own
+    margin balance and already absorbs its unrealized PnL, so subtracting it
+    removes both the position's capital and its PnL swings in one term."""
+    f_margin = sum(breakdown[c]["margin"] for c in foreign_coins)
+    f_notional = sum(breakdown[c]["notional"] for c in foreign_coins)
+    bot_av = account_value - f_margin
+    bot_free = bot_av - (margin_used - f_margin)  # == the account's real free margin
+    return bot_av, bot_free, total_notional - f_notional
+
+
+def tracked_coins(state):
+    return {e["coin"] for e in state["mirrored"].values() if e["mirrored"]}
+
+
 def handle_open(client, state, trade):
     tid = str(trade["id"])
     coin = normalize_ticker(trade["ticker"])
@@ -96,11 +113,15 @@ def handle_open(client, state, trade):
         return
     lev = min(entry["leverage"], config.MAX_LEVERAGE)
     account_value, total_notional, margin_used = client.margin_summary()
-    margin = allocate_margin(account_value, account_value - margin_used, total_notional, lev)
+    breakdown = client.position_breakdown()
+    foreign = set(breakdown) - tracked_coins(state)
+    bot_av, bot_free, bot_notional = adjust_for_foreign(
+        account_value, total_notional, margin_used, breakdown, foreign)
+    margin = allocate_margin(bot_av, bot_free, bot_notional, lev)
     if margin is None:
         logger.warning(f"OPEN {coin} rejected by risk limits "
-                       f"(account={account_value:.2f} free={account_value - margin_used:.2f} "
-                       f"notional={total_notional:.2f})")
+                       f"(capital={bot_av:.2f} free={bot_free:.2f} "
+                       f"notional={bot_notional:.2f})")
         return
     # Enter at ENTRY_IMPROVEMENT beyond the target's entry, in our favor
     # (long: below, short: above)
@@ -246,15 +267,41 @@ def retry_unmirrored(state):
 
 
 def reconcile(client, state):
-    """Warn when tracked mirrored positions and actual exchange positions diverge."""
+    """Warn when tracked mirrored positions and actual exchange positions
+    diverge. Untracked exchange positions are handled separately by
+    confirm_foreign_positions."""
     exchange = client.open_positions()
-    tracked = {e["coin"] for e in state["mirrored"].values() if e["mirrored"]}
-    for coin in sorted(set(exchange) - tracked):
-        logger.warning(f"Reconcile {coin} untracked on exchange size={exchange[coin]}, "
-                       "opens on this coin will be skipped")
-    for coin in sorted(tracked - set(exchange)):
+    for coin in sorted(tracked_coins(state) - set(exchange)):
         logger.warning(f"Reconcile {coin} tracked but missing on exchange "
                        "(TP/SL fired or closed manually?)")
+
+
+def confirm_foreign_positions(client, state, ask=input):
+    """List positions on the exchange that the bot didn't open and have the
+    user confirm they are to be ignored: they are never traded, and the bot's
+    capital is what remains after their equity. Returns False to abort startup."""
+    breakdown = client.position_breakdown()
+    foreign = set(breakdown) - tracked_coins(state)
+    if not foreign:
+        return True
+    sizes = client.open_positions()
+    print("\nPositions on the exchange not opened by the bot:")
+    for coin in sorted(foreign):
+        b = breakdown[coin]
+        print(f"  {coin:8} size={sizes[coin]} notional=${b['notional']:.2f} "
+              f"margin=${b['margin']:.2f} uPnL=${b['upnl']:+.2f}")
+    account_value, total_notional, margin_used = client.margin_summary()
+    bot_av, bot_free, _ = adjust_for_foreign(
+        account_value, total_notional, margin_used, breakdown, foreign)
+    print(f"Bot trading capital: ${bot_av:.2f} (free margin available: ${bot_free:.2f})")
+    print("NOTE: foreign positions must use ISOLATED margin.")
+    answer = ask("Ignore these positions and trade only with the remaining capital? [y/N] ")
+    if answer.strip().lower() not in ("y", "yes"):
+        logger.info("Foreign positions not confirmed, exiting")
+        return False
+    logger.info(f"Ignoring foreign positions {sorted(foreign)}, "
+                f"bot capital {bot_av:.2f}")
+    return True
 
 
 def poll_once(client, state, portfolio_id, jwt_token):
@@ -327,6 +374,8 @@ def main():
         # Dry-run never places orders, so tracked state and the exchange are
         # unrelated and comparing them would only produce false warnings
         reconcile(client, state)
+        if not confirm_foreign_positions(client, state):
+            return
 
     while True:
         try:
@@ -374,4 +423,7 @@ def _jwt_expired(e):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Mirror bot interrupted, remember positions still open on exchange")

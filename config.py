@@ -20,7 +20,7 @@ MAX_OPEN_TRADES = 3
 
 # Risk controls (phase 3). The notional caps apply to every open.
 MAX_POSITION_NOTIONAL_USD = 20_000.0  # hard cap on any single position's notional
-MAX_ACCOUNT_LEVERAGE = 10.0           # cap on total open notional / account value
+MAX_ACCOUNT_LEVERAGE = 15.0           # cap on total open notional / account value
 
 SLIPPAGE = 0.01
 
@@ -33,7 +33,7 @@ IGNORED_COINS = set()
 # price never reaches the trigger, the trade is never entered.
 ENTRY_IMPROVEMENT = 0.005
 
-MAX_LEVERAGE = 10          # cap regardless of the target's leverage
+MAX_LEVERAGE = 20          # cap regardless of the target's leverage
 MIN_NOTIONAL_USD = 10.0    # Hyperliquid minimum order size
 
 # When True, every order is logged but nothing is sent to the exchange
