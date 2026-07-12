@@ -277,30 +277,40 @@ def reconcile(client, state):
 
 
 def confirm_foreign_positions(client, state, ask=input):
-    """List positions on the exchange that the bot didn't open and have the
-    user confirm they are to be ignored: they are never traded, and the bot's
-    capital is what remains after their equity. Returns False to abort startup."""
+    """Print the trading capital the bot will use and the positions that count
+    as foreign (on the exchange but not opened by the bot): they are never
+    traded, and the bot's capital is what remains after their isolated margin.
+    Always asks the user to confirm the capital; returns False to abort startup."""
     breakdown = client.position_breakdown()
-    foreign = set(breakdown) - tracked_coins(state)
-    if not foreign:
-        return True
     sizes = client.open_positions()
-    print("\nPositions on the exchange not opened by the bot:")
-    for coin in sorted(foreign):
-        b = breakdown[coin]
-        print(f"  {coin:8} size={sizes[coin]} notional=${b['notional']:.2f} "
-              f"margin=${b['margin']:.2f} uPnL=${b['upnl']:+.2f}")
+    # A pending entry trigger that fired while the bot was down leaves a
+    # position the first poll will promote - it's ours, not foreign
+    pending_fills = {e["coin"] for e in state["mirrored"].values()
+                     if not e["mirrored"] and e.get("entry_oid") is not None
+                     and sizes.get(e["coin"])
+                     and (sizes[e["coin"]] > 0) == e["is_buy"]}
+    foreign = set(breakdown) - tracked_coins(state) - pending_fills
     account_value, total_notional, margin_used = client.margin_summary()
     bot_av, bot_free, _ = adjust_for_foreign(
         account_value, total_notional, margin_used, breakdown, foreign)
-    print(f"Bot trading capital: ${bot_av:.2f} (free margin available: ${bot_free:.2f})")
-    print("NOTE: foreign positions must use ISOLATED margin.")
-    answer = ask("Ignore these positions and trade only with the remaining capital? [y/N] ")
-    if answer.strip().lower() not in ("y", "yes"):
-        logger.info("Foreign positions not confirmed, exiting")
+    if foreign:
+        print("\nPositions on the exchange not opened by the bot (foreign):")
+        for coin in sorted(foreign):
+            b = breakdown[coin]
+            print(f"  {coin:8} size={sizes[coin]} notional=${b['notional']:.2f} "
+                  f"margin=${b['margin']:.2f} uPnL=${b['upnl']:+.2f}")
+        print(f"Bot trading capital: ${bot_av:.2f} (free margin available: ${bot_free:.2f})")
+        print("NOTE: foreign positions must use ISOLATED margin.")
+        prompt = "Ignore these positions and trade only with the remaining capital? [y/N] "
+    else:
+        print(f"\nNo foreign positions on the exchange.\n"
+              f"Bot trading capital: ${bot_av:.2f} (free margin available: ${bot_free:.2f})")
+        prompt = "Trade with this capital? [y/N] "
+    if ask(prompt).strip().lower() not in ("y", "yes"):
+        logger.info("Trading capital not confirmed, exiting")
         return False
-    logger.info(f"Ignoring foreign positions {sorted(foreign)}, "
-                f"bot capital {bot_av:.2f}")
+    logger.info(f"Bot capital {bot_av:.2f} confirmed, "
+                f"foreign positions {sorted(foreign) or 'none'}")
     return True
 
 

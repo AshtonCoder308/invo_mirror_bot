@@ -465,14 +465,25 @@ def test_confirm_foreign_positions():
     assert confirm_foreign_positions(client, state, ask=lambda _: "n") is False
     assert confirm_foreign_positions(client, state, ask=lambda _: "") is False
 
-    def never_ask(prompt):
-        raise AssertionError("prompted with no foreign positions")
-
-    # Bot-tracked positions aren't foreign: no prompt at all
+    # Bot-tracked positions aren't foreign, but the capital still needs a yes
     client = StubClient(positions={"BTC": 1.0},
                         breakdown={"BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}})
     state = {"mirrored": {"1": mirrored_entry()}}
-    assert confirm_foreign_positions(client, state, ask=never_ask) is True
+    assert confirm_foreign_positions(client, state, ask=lambda _: "y") is True
+    assert confirm_foreign_positions(client, state, ask=lambda _: "n") is False
+
+    # A pending entry whose trigger fired while the bot was down (long BTC
+    # position matches the entry) is ours - promoted on the first poll
+    client = StubClient(positions={"BTC": 2.0},
+                        breakdown={"BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}})
+    state = {"mirrored": {"1": pending_entry(oid=7)}}
+    assert confirm_foreign_positions(client, state, ask=lambda _: "y") is True
+
+    # But an opposite-direction position on a pending entry's coin is foreign
+    client = StubClient(positions={"BTC": -2.0}, account=(1000.0, 300.0, 100.0),
+                        breakdown={"BTC": {"margin": 100.0, "notional": 300.0, "upnl": 0.0}})
+    state = {"mirrored": {"1": pending_entry(oid=7)}}
+    assert confirm_foreign_positions(client, state, ask=lambda _: "y") is True
 
 
 def test_normalize_ticker():
